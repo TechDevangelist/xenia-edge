@@ -13,6 +13,7 @@
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_ui.h"
 #include "xenia/ui/file_picker.h"
+#include "xenia/ui/imgui_host_notification.h"
 
 #include "xenia/kernel/xam/ui/create_profile_ui.h"
 #include "xenia/kernel/xam/ui/gamercard_ui.h"
@@ -218,6 +219,19 @@ void ProfileConfigDialog::OnDraw(ImGuiIO& io) {
           if (ImGui::MenuItem("Logout")) {
             profile_manager->Logout(user_index);
             LoadProfileIcon(xuid);
+          }
+
+          ImGui::Separator();
+
+          auto account_live = account;
+          bool is_live = account_live.IsLiveEnabled();
+          if (ImGui::MenuItem("Live Enabled", nullptr, &is_live)) {
+            account_live.ToggleLiveFlag(is_live);
+            if (profile_manager->UpdateAccount(xuid, &account_live)) {
+              new ui::HostNotificationWindow(
+                  imgui_drawer(), "Xbox Live",
+                  is_live ? "Signed In" : "Signed Out", user_index);
+            }
           }
         }
         ImGui::EndPopup();

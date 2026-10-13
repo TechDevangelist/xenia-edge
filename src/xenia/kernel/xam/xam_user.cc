@@ -50,21 +50,22 @@ X_HRESULT_result_t XamUserGetXUID_entry(dword_t user_index, dword_t type_mask,
   const auto& user_profile =
       kernel_state()->xam_state()->GetUserProfile(user_index);
 
-  uint32_t result = X_E_NO_SUCH_USER;
-  uint64_t xuid = 0;
-
-  auto type = user_profile->type() & type_mask;
-  if (type & (2 | 4)) {
-    // maybe online profile?
-    xuid = user_profile->xuid();
-    result = X_E_SUCCESS;
-  } else if (type & 1) {
-    // maybe offline profile?
-    xuid = user_profile->xuid();
-    result = X_E_SUCCESS;
+  // Only a user signed in to Live has an online XUID to give.
+  uint32_t types = X_USER_XUID_OFFLINE;
+  if (user_profile->signin_state() ==
+      static_cast<uint32_t>(SignInState::SignedInToLive)) {
+    types |= X_USER_XUID_ONLINE;
   }
-  *xuid_ptr = xuid;
-  return result;
+  types &= type_mask;
+
+  if (types & X_USER_XUID_ONLINE) {
+    *xuid_ptr = user_profile->GetOnlineXUID();
+  } else if (types & X_USER_XUID_OFFLINE) {
+    *xuid_ptr = user_profile->xuid();
+  } else {
+    return X_E_NO_SUCH_USER;
+  }
+  return X_E_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamUserGetXUID, kUserProfiles, kImplemented);
 
@@ -127,8 +128,17 @@ X_HRESULT_result_t XamUserGetSigninInfo_entry(
   xe::string_util::copy_truncating(info->name, user_profile->name(),
                                    xe::countof(info->name));
 
-  if (!flags || flags & X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY) {
+  if (user_profile->IsLiveEnabled()) {
+    info->flags = X_USER_INFO_FLAG_LIVE_ENABLED;
+  }
+
+  // ONLINE_XUID_ONLY wins when both are set.
+  if (flags & X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY) {
+    info->xuid = user_profile->GetOnlineXUID();
+  } else if (flags & X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY) {
     info->xuid = user_profile->xuid();
+  } else {
+    info->xuid = user_profile->GetLogonXUID();
   }
 
   info->signin_state = user_profile->signin_state();
@@ -406,16 +416,27 @@ DECLARE_XAM_EXPORT1(XamUserWriteProfileSettings, kUserProfiles, kImplemented);
 
 dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
                                            lpdword_t out_value) {
+  *out_value = 0;
+
+  // With no Live service, a user signed in to Live holds every Live privilege.
+  const bool granted = mask >= 0xD1 && mask <= 0xFF;
+
+  // Every Live user holds the same privileges so the first one answers.
   if (user_index == XUserIndexAny) {
-    for (uint8_t i = 0; i < XUserMaxUserCount; ++i) {
-      const auto result = XamUserCheckPrivilege_entry(i, mask, out_value);
-      if (result != X_ERROR_NO_SUCH_USER) {
-        *out_value = 0;
-        return result;
+    X_RESULT result = X_ERROR_NO_SUCH_USER;
+    for (uint32_t i = 0; i < XUserMaxUserCount; ++i) {
+      const auto user_profile = kernel_state()->xam_state()->GetUserProfile(i);
+      if (!user_profile) {
+        continue;
       }
+      if (user_profile->signin_state() ==
+          static_cast<uint32_t>(SignInState::SignedInToLive)) {
+        *out_value = granted;
+        return X_ERROR_SUCCESS;
+      }
+      result = X_ERROR_NOT_LOGGED_ON;
     }
-    *out_value = 0;
-    return X_ERROR_NO_SUCH_USER;
+    return result;
   }
 
   if (user_index >= XUserMaxUserCount) {
@@ -428,15 +449,13 @@ dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
 
   if (kernel_state()->xam_state()->GetUserProfile(user_index)->signin_state() !=
       static_cast<uint32_t>(SignInState::SignedInToLive)) {
-    *out_value = 0;
     return X_ERROR_NOT_LOGGED_ON;
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  *out_value = granted;
   return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamUserCheckPrivilege, kUserProfiles, kStub);
+DECLARE_XAM_EXPORT1(XamUserCheckPrivilege, kUserProfiles, kSketchy);
 
 dword_result_t XamUserContentRestrictionGetFlags_entry(dword_t user_index,
                                                        lpdword_t out_flags) {
@@ -550,7 +569,6 @@ dword_result_t XamUserAreUsersFriends_entry(
         result = X_ERROR_NOT_LOGGED_ON;
       } else {
         // No friends!
-        are_friends = true;
         result = X_ERROR_SUCCESS;
       }
     } else {

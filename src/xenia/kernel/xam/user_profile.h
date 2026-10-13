@@ -108,12 +108,21 @@ class UserProfile {
     return IsLiveEnabled() ? static_cast<uint64_t>(account_info_.xuid_online)
                            : 0;
   }
+  // Titles know a user signed in to Live by the online XUID.
+  uint64_t GetLogonXUID() const {
+    return signin_state() == static_cast<uint32_t>(SignInState::SignedInToLive)
+               ? GetOnlineXUID()
+               : xuid_;
+  }
 
   std::string name() const { return account_info_.GetGamertagString(); }
+  // With no Live service to sign in to, a Live-enabled profile counts as
+  // signed in to Live.
   uint32_t signin_state() const {
-    return static_cast<uint32_t>(SignInState::SignedInLocally);
+    return static_cast<uint32_t>(IsLiveEnabled()
+                                     ? SignInState::SignedInToLive
+                                     : SignInState::SignedInLocally);
   };
-  uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   uint32_t GetReservedFlags() const {
     return account_info_.GetReservedFlags();

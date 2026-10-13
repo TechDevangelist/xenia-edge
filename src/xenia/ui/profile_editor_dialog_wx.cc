@@ -640,13 +640,7 @@ void ProfileEditorDialog::OnSave() {
                        static_cast<int>(account.GetSubscriptionTier()))));
 
   if (std::memcmp(&account, &account_original, sizeof(X_XAMACCOUNTINFO)) != 0) {
-    if (!signed_in) {
-      pm->MountProfile(xuid_);
-    }
     pm->UpdateAccount(xuid_, &account);
-    if (!signed_in) {
-      pm->DismountProfile(xuid_);
-    }
   }
 
   if (current_data_.profile_icon != original_data_.profile_icon) {

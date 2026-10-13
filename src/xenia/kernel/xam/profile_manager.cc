@@ -384,6 +384,11 @@ void ProfileManager::Login(const uint64_t xuid, const uint8_t user_index,
 
   MountProfile(xuid);
 
+  if (profile.IsLiveEnabled() && SetLiveDefaults(&profile) &&
+      !WriteAccount(xuid, &profile)) {
+    XELOGW("Profile {:016X}: could not save its Live defaults", xuid);
+  }
+
   logged_profiles_[assigned_user_slot] =
       std::make_unique<UserProfile>(xuid, &profile);
 
@@ -502,7 +507,8 @@ uint8_t ProfileManager::GetUserIndexAssignedToProfile(
 
     return index;
   }
-  return XUserIndexAny;
+  // Titles know a user signed in to Live by the online XUID.
+  return GetUserIndexAssignedToLiveProfile(xuid);
 }
 
 uint8_t ProfileManager::GetUserIndexAssignedToLiveProfile(
@@ -608,7 +614,7 @@ bool ProfileManager::CreateAccount(const uint64_t xuid,
   string_util::copy_and_swap_truncating(account.gamertag, gamertag_u16,
                                         xe::countof(account.gamertag));
 
-  const bool result = UpdateAccount(xuid, &account);
+  const bool result = WriteAccount(xuid, &account);
   DismountProfile(xuid);
 
   if (result) {
@@ -619,7 +625,7 @@ bool ProfileManager::CreateAccount(const uint64_t xuid,
 
 bool ProfileManager::CreateAccount(const uint64_t xuid,
                                    const X_XAMACCOUNTINFO* account) {
-  const bool result = UpdateAccount(xuid, account);
+  const bool result = WriteAccount(xuid, account);
   if (result) {
     accounts_.insert({xuid, *account});
   }
@@ -628,6 +634,42 @@ bool ProfileManager::CreateAccount(const uint64_t xuid,
 
 bool ProfileManager::UpdateAccount(const uint64_t xuid,
                                    const X_XAMACCOUNTINFO* account) {
+  X_XAMACCOUNTINFO updated = *account;
+  if (updated.IsLiveEnabled()) {
+    SetLiveDefaults(&updated);
+  }
+
+  // A signed-in profile is mounted already.
+  UserProfile* profile = GetProfile(xuid);
+  if (!profile && !MountProfile(xuid)) {
+    return false;
+  }
+  const bool written = WriteAccount(xuid, &updated);
+  if (!profile) {
+    DismountProfile(xuid);
+  }
+  if (!written) {
+    return false;
+  }
+
+  accounts_.insert_or_assign(xuid, updated);
+
+  if (profile) {
+    const bool live_changed =
+        profile->IsLiveEnabled() != updated.IsLiveEnabled();
+    profile->account_info_ = updated;
+    // Turning Live on or off moves the user between signed in locally and
+    // signed in to Live.
+    if (live_changed) {
+      kernel_state_->BroadcastNotification(kXNotificationSystemSignInChanged,
+                                           GetUsedUserSlots().to_ulong());
+    }
+  }
+  return true;
+}
+
+bool ProfileManager::WriteAccount(const uint64_t xuid,
+                                  const X_XAMACCOUNTINFO* account) {
   const std::string guest_path =
       fmt::format(kDefaultMountFormat, xuid) + ":\\Account";
 
@@ -652,10 +694,32 @@ bool ProfileManager::UpdateAccount(const uint64_t xuid,
       std::span<uint8_t>(encrypted_data.data(), encrypted_data.size()), 0,
       &written_bytes);
   output_file->Destroy();
-
-  // Refresh the in-memory account data
-  accounts_.insert_or_assign(xuid, *account);
   return true;
+}
+
+bool ProfileManager::SetLiveDefaults(X_XAMACCOUNTINFO* account) const {
+  const X_XAMACCOUNTINFO original = *account;
+
+  if (!account->xuid_online) {
+    account->xuid_online = GenerateOnlineXuid();
+  }
+  if (account->GetSubscriptionTier() ==
+      X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierNone) {
+    account->SetSubscriptionTier(
+        X_XAMACCOUNTINFO::AccountSubscriptionTier::kSubscriptionTierGold);
+  }
+  if (!static_cast<uint32_t>(account->GetCountry())) {
+    account->SetCountry(static_cast<XOnlineCountry>(
+        kernel_state_->xconfig()->ReadSetting<uint8_t>(XCONFIG_USER_CATEGORY,
+                                                       XCONFIG_USER_COUNTRY)));
+  }
+  if (account->GetLanguage() == XLanguage::kInvalid) {
+    account->SetLanguage(
+        static_cast<XLanguage>(kernel_state_->xconfig()->ReadSetting<uint32_t>(
+            XCONFIG_USER_CATEGORY, XCONFIG_USER_LANGUAGE)));
+  }
+
+  return std::memcmp(&original, account, sizeof(X_XAMACCOUNTINFO)) != 0;
 }
 
 void ProfileManager::UpdateConfig(const uint64_t xuid, const uint8_t slot) {

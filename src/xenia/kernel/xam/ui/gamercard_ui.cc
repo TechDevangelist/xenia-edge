@@ -632,16 +632,8 @@ void GamercardUI::SaveAccountData() {
                                         std::size(account.gamertag));
 
   if (std::memcmp(&account, &account_original, sizeof(X_XAMACCOUNTINFO)) != 0) {
-    if (!is_signed_in_) {
-      kernel_state()->xam_state()->profile_manager()->MountProfile(xuid_);
-    }
-
     kernel_state()->xam_state()->profile_manager()->UpdateAccount(xuid_,
                                                                   &account);
-
-    if (!is_signed_in_) {
-      kernel_state()->xam_state()->profile_manager()->DismountProfile(xuid_);
-    }
   }
 }
 
