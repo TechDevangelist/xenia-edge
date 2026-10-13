@@ -11,8 +11,10 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
@@ -122,19 +124,6 @@ static_assert_size(XAUTH_SETTINGS, 0xC);
 struct XWSABUF {
   xe::be<uint32_t> len;
   xe::be<uint32_t> buf_ptr;
-};
-
-struct XWSAOVERLAPPED {
-  xe::be<uint32_t> internal;
-  xe::be<uint32_t> internal_high;
-  union {
-    struct {
-      xe::be<uint32_t> low;
-      xe::be<uint32_t> high;
-    } offset;  // must be named to avoid GCC error
-    xe::be<uint32_t> pointer;
-  };
-  xe::be<uint32_t> event_handle;
 };
 
 #pragma pack(push, 4)
@@ -387,24 +376,92 @@ dword_result_t NetDll_WSAGetLastError_entry() {
 DECLARE_XAM_EXPORT1(NetDll_WSAGetLastError, kNetworking, kImplemented);
 
 dword_result_t NetDll_WSARecvFrom_entry(
-    dword_t caller, dword_t socket, pointer_t<XWSABUF> buffers_ptr,
+    dword_t caller, dword_t socket_handle, pointer_t<XWSABUF> buffers_ptr,
     dword_t buffer_count, lpdword_t num_bytes_recv, lpdword_t flags_ptr,
-    pointer_t<XSOCKADDR_IN> from_addr, pointer_t<XWSAOVERLAPPED> overlapped_ptr,
-    lpvoid_t completion_routine_ptr) {
-  if (overlapped_ptr) {
-    // auto evt = kernel_state()->object_table()->LookupObject<XEvent>(
-    //    overlapped_ptr->event_handle);
-
-    // if (evt) {
-    //  //evt->Set(0, false);
-    //}
+    pointer_t<XSOCKADDR_IN> from_ptr, lpdword_t from_len_ptr,
+    pointer_t<XWSAOVERLAPPED> overlapped_ptr, lpvoid_t completion_routine_ptr) {
+  auto socket =
+      kernel_state()->object_table()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAENOTSOCK));
+    return -1;
+  }
+  if (!buffers_ptr || !buffer_count) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAEINVAL));
+    return -1;
   }
 
-  // we're not going to be receiving packets any time soon
-  // return error so we don't wait on that - Cancerous
-  return -1;
+  std::vector<std::span<uint8_t>> buffers;
+  for (uint32_t i = 0; i < buffer_count; ++i) {
+    buffers.emplace_back(
+        kernel_memory()->TranslateVirtual<uint8_t*>(buffers_ptr[i].buf_ptr),
+        static_cast<uint32_t>(buffers_ptr[i].len));
+  }
+  const int received =
+      socket->WSARecvFrom(std::move(buffers), flags_ptr ? flags_ptr.value() : 0,
+                          from_ptr, from_len_ptr, overlapped_ptr);
+  if (received < 0) {
+    XThread::SetLastError(socket->GetLastWSAError());
+    return -1;
+  }
+  if (num_bytes_recv) {
+    *num_bytes_recv = static_cast<uint32_t>(received);
+  }
+  if (flags_ptr) {
+    *flags_ptr = 0;
+  }
+  return 0;
 }
-DECLARE_XAM_EXPORT2(NetDll_WSARecvFrom, kNetworking, kStub, kHighFrequency);
+DECLARE_XAM_EXPORT2(NetDll_WSARecvFrom, kNetworking, kImplemented,
+                    kHighFrequency);
+
+dword_result_t NetDll_WSAGetOverlappedResult_entry(
+    dword_t caller, dword_t socket_handle,
+    pointer_t<XWSAOVERLAPPED> overlapped_ptr, lpdword_t bytes_ptr, dword_t wait,
+    lpdword_t flags_ptr) {
+  auto socket =
+      kernel_state()->object_table()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAENOTSOCK));
+    return 0;
+  }
+  if (!overlapped_ptr) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSAEINVAL));
+    return 0;
+  }
+
+  while (socket->IsOverlappedPending(overlapped_ptr)) {
+    auto event = overlapped_ptr->event_handle
+                     ? kernel_state()->object_table()->LookupObject<XEvent>(
+                           overlapped_ptr->event_handle)
+                     : object_ref<XEvent>();
+    if (!wait || !event) {
+      XThread::SetLastError(uint32_t(X_WSAError::X_WSA_IO_INCOMPLETE));
+      return 0;
+    }
+    event->Wait(0, 0, false, nullptr);
+  }
+
+  if (bytes_ptr) {
+    *bytes_ptr = overlapped_ptr->internal_high;
+  }
+  if (flags_ptr) {
+    *flags_ptr = 0;
+  }
+  // Closing the socket drops a pending receive.
+  if (overlapped_ptr->internal == X_STATUS_PENDING) {
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSA_OPERATION_ABORTED));
+    return 0;
+  }
+  // internal holds the WSA error of a failed operation.
+  if (overlapped_ptr->internal) {
+    XThread::SetLastError(overlapped_ptr->internal);
+    return 0;
+  }
+  return 1;
+}
+DECLARE_XAM_EXPORT2(NetDll_WSAGetOverlappedResult, kNetworking, kImplemented,
+                    kHighFrequency);
 
 // If the socket is a VDP socket, buffer 0 is the game data length, and buffer 1
 // is the unencrypted game data.

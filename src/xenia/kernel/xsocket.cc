@@ -9,7 +9,9 @@
 
 #include "xenia/kernel/xsocket.h"
 
+#include <algorithm>
 #include <cstring>
+#include <deque>
 #include <thread>
 
 #include "xenia/base/clock.h"
@@ -60,6 +62,115 @@ static asio::io_context& GetIoContext() {
   static IoContextRunner runner;
   return runner.get();
 }
+
+namespace {
+
+// Spreads one datagram over the guest's buffers in order.
+void Scatter(std::span<const uint8_t> data,
+             std::vector<std::span<uint8_t>>& buffers) {
+  for (auto& buffer : buffers) {
+    const size_t size = std::min(buffer.size(), data.size());
+    std::memcpy(buffer.data(), data.data(), size);
+    data = data.subspan(size);
+  }
+}
+
+// The byte count lands first since a title may poll internal.
+void CompleteOverlapped(XWSAOVERLAPPED* overlapped, uint32_t status,
+                        uint32_t bytes) {
+  overlapped->internal_high = bytes;
+  std::atomic_thread_fence(std::memory_order_release);
+  overlapped->internal = status;
+}
+
+}  // namespace
+
+struct XSocket::OverlappedReceives {
+  struct Receive {
+    std::vector<std::span<uint8_t>> buffers;
+    XSOCKADDR_IN* from;
+    xe::be<uint32_t>* from_len;
+    XWSAOVERLAPPED* overlapped;
+    object_ref<XEvent> event;
+  };
+
+  explicit OverlappedReceives(net::SystemLinkPort* port) : port(port) {}
+
+  // mutex held.
+  bool Pending(const XWSAOVERLAPPED* overlapped) const {
+    return std::ranges::any_of(pending, [overlapped](const Receive& receive) {
+      return receive.overlapped == overlapped;
+    });
+  }
+
+  // Fills the pending receives in order while datagrams are queued.
+  void Complete() {
+    std::vector<object_ref<XEvent>> completed;
+    std::unique_lock lock(mutex);
+    while (port && !pending.empty()) {
+      Receive& receive = pending.front();
+      size_t size = 0;
+      for (const auto& buffer : receive.buffers) {
+        size += buffer.size();
+      }
+      std::vector<uint8_t> data(size);
+      net::Endpoint source;
+      uint32_t error = 0;
+      const int received = port->Receive(data, false, source, 0, error);
+      if (received < 0 && error == net::kWsaWouldBlock) {
+        break;
+      }
+      // A datagram too large for the buffers still fills them.
+      const bool filled = received >= 0 || error == net::kWsaMessageSize;
+      const size_t bytes = received >= 0 ? size_t(received) : filled ? size : 0;
+      if (filled) {
+        Scatter({data.data(), bytes}, receive.buffers);
+        if (receive.from) {
+          receive.from->sin_family = AF_INET;
+          receive.from->sin_addr = source.address;
+          receive.from->sin_port = source.port;
+          std::memset(receive.from->x_sin_zero, 0,
+                      sizeof(receive.from->x_sin_zero));
+        }
+        if (receive.from_len) {
+          *receive.from_len = sizeof(XSOCKADDR_IN);
+        }
+      }
+      CompleteOverlapped(receive.overlapped, received >= 0 ? 0 : error,
+                         static_cast<uint32_t>(bytes));
+      if (receive.event) {
+        completed.push_back(std::move(receive.event));
+      }
+      pending.pop_front();
+    }
+    lock.unlock();
+    // Waking a waiter takes scheduler locks, which must not nest in this one.
+    for (auto& event : completed) {
+      event->Set(0, false);
+    }
+  }
+
+  // Wakes the waiters without touching guest memory, which may be going away
+  // with the socket.
+  void Close() {
+    std::deque<Receive> dropped;
+    {
+      std::lock_guard lock(mutex);
+      port = nullptr;
+      dropped.swap(pending);
+    }
+    for (auto& receive : dropped) {
+      if (receive.event) {
+        receive.event->Set(0, false);
+      }
+    }
+  }
+
+  std::mutex mutex;
+  // Null once the socket closes.
+  net::SystemLinkPort* port;
+  std::deque<Receive> pending;
+};
 
 // Translate socket options to native
 // Note:
@@ -234,6 +345,9 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 }
 
 X_STATUS XSocket::Close() {
+  if (overlapped_receives_) {
+    overlapped_receives_->Close();
+  }
   if (system_link_port_) {
     // Kept until destruction since a receive on another thread may be in it.
     system_link_port_->Close();
@@ -857,6 +971,82 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
   return static_cast<int>(bytes_sent);
 }
 
+int XSocket::WSARecvFrom(std::vector<std::span<uint8_t>> buffers,
+                         uint32_t flags, XSOCKADDR_IN* from,
+                         xe::be<uint32_t>* from_len,
+                         XWSAOVERLAPPED* overlapped) {
+  if (overlapped) {
+    if (!UsesSystemLink()) {
+      last_error_ = 10045;  // WSAEOPNOTSUPP
+      return -1;
+    }
+    if (!overlapped_receives_) {
+      last_error_ = 10022;  // WSAEINVAL
+      return -1;
+    }
+    object_ref<XEvent> event;
+    if (overlapped->event_handle) {
+      event = kernel_state()->object_table()->LookupObject<XEvent>(
+          overlapped->event_handle);
+    }
+    auto receives = overlapped_receives_;
+    {
+      std::lock_guard lock(receives->mutex);
+      // Ikaruga posts the same overlapped again while it is still pending.
+      if (!receives->Pending(overlapped)) {
+        if (event) {
+          event->Reset();
+        }
+        overlapped->internal = X_STATUS_PENDING;
+        overlapped->internal_high = 0;
+        receives->pending.push_back(
+            {std::move(buffers), from, from_len, overlapped, std::move(event)});
+      }
+    }
+    // A datagram queued already won't run the ready callback again.
+    asio::post(GetIoContext(), [receives]() { receives->Complete(); });
+    last_error_ = uint32_t(X_WSAError::X_WSA_IO_PENDING);
+    return -1;
+  }
+
+  size_t size = 0;
+  for (const auto& buffer : buffers) {
+    size += buffer.size();
+  }
+  std::vector<uint8_t> data(size);
+  N_XSOCKADDR_IN native_from;
+  if (from) {
+    native_from = *from;
+  }
+  uint32_t native_from_len = sizeof(native_from);
+  const int received = RecvFrom(data.data(), static_cast<uint32_t>(size), flags,
+                                &native_from, &native_from_len);
+  // A datagram too large for the buffers still fills them.
+  const bool filled = received >= 0 || last_error_ == net::kWsaMessageSize;
+  if (!filled) {
+    return -1;
+  }
+  Scatter({data.data(), received >= 0 ? size_t(received) : size}, buffers);
+  if (from) {
+    from->sin_family = native_from.sin_family;
+    from->sin_port = native_from.sin_port;
+    from->sin_addr = native_from.sin_addr;
+    std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
+  }
+  if (from_len) {
+    *from_len = native_from_len;
+  }
+  return received;
+}
+
+bool XSocket::IsOverlappedPending(const XWSAOVERLAPPED* overlapped) const {
+  if (!overlapped_receives_) {
+    return false;
+  }
+  std::lock_guard lock(overlapped_receives_->mutex);
+  return overlapped_receives_->Pending(overlapped);
+}
+
 // Winsock FD_* flags split into asio wait_read / wait_write groups.
 namespace {
 constexpr uint32_t kFD_READ = 1;
@@ -905,7 +1095,7 @@ int XSocket::WSAEventSelect(object_ref<XEvent> event, uint32_t flags) {
   selected_event_flags_ = flags;
 
   if (system_link_port_) {
-    ArmSystemLinkEvent();
+    ArmSystemLinkReady();
     return 0;
   }
 
@@ -1040,13 +1230,13 @@ X_STATUS XSocket::BindSystemLink(uint32_t address, uint16_t port) {
     return X_STATUS_UNSUCCESSFUL;
   }
   system_link_port_ = std::move(bound);
+  overlapped_receives_ =
+      std::make_shared<OverlappedReceives>(system_link_port_.get());
   system_link_address_ = own;
   bound_port_ = system_link_port_->port();
   bound_ = true;
   std::lock_guard<std::mutex> lock(select_mutex_);
-  if (selected_event_) {
-    ArmSystemLinkEvent();
-  }
+  ArmSystemLinkReady();
   return X_STATUS_SUCCESS;
 }
 
@@ -1119,14 +1309,17 @@ uint32_t XSocket::SystemLinkWait() const {
                           : net::SystemLinkPort::kWaitForever;
 }
 
-void XSocket::ArmSystemLinkEvent() {
+void XSocket::ArmSystemLinkReady() {
   auto event = selected_event_;
   const uint32_t flags = event ? selected_event_flags_ : 0;
-  std::function<void()> ready;
-  if (flags & kReadEvents) {
-    ready = [event]() { event->Set(0, false); };
-  }
-  system_link_port_->SetReadyCallback(std::move(ready));
+  system_link_port_->SetReadyCallback(
+      [event, flags, receives = overlapped_receives_]() {
+        if (flags & kReadEvents) {
+          event->Set(0, false);
+        }
+        // Receiving here would call back into the System Link.
+        asio::post(GetIoContext(), [receives]() { receives->Complete(); });
+      });
   // A datagram socket can always send.
   if (flags & kWriteEvents) {
     event->Set(0, false);

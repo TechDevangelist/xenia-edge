@@ -16,8 +16,11 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <queue>
+#include <span>
+#include <vector>
 
 #include "xenia/base/byte_order.h"
 #include "xenia/kernel/xobject.h"
@@ -30,6 +33,9 @@ class XEvent;
 
 enum class X_WSAError : uint32_t {
   X_WSA_INVALID_PARAMETER = 0x0057,
+  X_WSA_OPERATION_ABORTED = 0x03E3,
+  X_WSA_IO_INCOMPLETE = 0x03E4,
+  X_WSA_IO_PENDING = 0x03E5,
   X_WSAEFAULT = 0x271E,
   X_WSAEINVAL = 0x2726,
   X_WSAENOTSOCK = 0x2736,
@@ -85,6 +91,19 @@ struct N_XSOCKADDR_IN {
   xe::be<uint32_t> sin_addr;
   // sin_zero is defined as __pad on Android, so prefixed here.
   char x_sin_zero[8];
+};
+
+struct XWSAOVERLAPPED {
+  xe::be<uint32_t> internal;       // STATUS_PENDING, then 0 or a WSA error
+  xe::be<uint32_t> internal_high;  // Bytes transferred
+  union {
+    struct {
+      xe::be<uint32_t> low;
+      xe::be<uint32_t> high;
+    } offset;  // must be named to avoid GCC error
+    xe::be<uint32_t> pointer;
+  };
+  xe::be<uint32_t> event_handle;
 };
 
 class XSocket : public XObject {
@@ -144,6 +163,12 @@ class XSocket : public XObject {
                N_XSOCKADDR_IN* from, uint32_t* from_len);
   int SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* to,
              uint32_t to_len);
+  // Receives one datagram across |buffers|. An |overlapped| receive (System
+  // Link only) pends until the I/O thread completes it.
+  int WSARecvFrom(std::vector<std::span<uint8_t>> buffers, uint32_t flags,
+                  XSOCKADDR_IN* from, xe::be<uint32_t>* from_len,
+                  XWSAOVERLAPPED* overlapped);
+  bool IsOverlappedPending(const XWSAOVERLAPPED* overlapped) const;
 
   // Associates the socket with an XEvent signaled on readiness for any of the
   // requested Winsock FD_* flags. flags == 0 detaches.
@@ -193,9 +218,9 @@ class XSocket : public XObject {
                      const N_XSOCKADDR_IN* to);
   // How long a System Link receive waits on this thread.
   uint32_t SystemLinkWait() const;
-  // Hooks the WSAEventSelect event up to the System Link port. select_mutex_
-  // held.
-  void ArmSystemLinkEvent();
+  // Hooks the WSAEventSelect event and the overlapped receives up to the
+  // System Link port. select_mutex_ held.
+  void ArmSystemLinkReady();
 
   // Reads the local or remote address into xenia's own layout. Some hosts lay
   // sockaddr_in out differently.
@@ -242,6 +267,10 @@ class XSocket : public XObject {
   // A datagram socket of a title running System Link.
   bool on_system_link_ = false;
   std::unique_ptr<net::SystemLinkPort> system_link_port_;
+  // Overlapped receives, shared with the port's ready callback that completes
+  // them on the I/O thread.
+  struct OverlappedReceives;
+  std::shared_ptr<OverlappedReceives> overlapped_receives_;
   // This console's XNADDR ina, what getsockname reports.
   uint32_t system_link_address_ = 0;
   // Set by connect(), where send() goes.
