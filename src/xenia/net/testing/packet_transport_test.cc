@@ -10,10 +10,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <future>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <asio.hpp>
@@ -116,6 +119,36 @@ TEST_CASE("UDP tunnel carries frames to other instances", "[net][transport]") {
   // Instances on one machine share the port.
   CHECK(OpenUdpTunnelTransport(kMacB, port_a, {}, error));
   CHECK(a->healthy());
+}
+
+TEST_CASE("Transports stop waiting for a frame when woken",
+          "[net][transport]") {
+  Peer engine;
+  std::string error;
+  std::unique_ptr<PacketTransport> transports[] = {
+      OpenUdpTunnelTransport(kMacA, FreePort(), {{kLoopback, FreePort()}},
+                             error),
+      OpenKaiTransport(kMacA, {kLoopback, engine.port()}, error)};
+  for (auto& transport : transports) {
+    REQUIRE(transport);
+    for (bool before : {true, false}) {
+      if (before) {
+        transport->Wake();
+      }
+      auto waiting = std::async(std::launch::async, [&] {
+        std::vector<uint8_t> frame;
+        return transport->Receive(frame, 10000);
+      });
+      if (!before) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        transport->Wake();
+      }
+      REQUIRE(waiting.wait_for(std::chrono::seconds(1)) ==
+              std::future_status::ready);
+      CHECK_FALSE(waiting.get());
+    }
+    CHECK(transport->healthy());
+  }
 }
 
 TEST_CASE("Subnet broadcasts skip loopback", "[net][transport]") {

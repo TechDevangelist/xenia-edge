@@ -29,8 +29,11 @@ class PacketTransport {
   virtual bool healthy() const { return true; }
   // Returns the bytes sent or -1.
   virtual int Send(std::span<const uint8_t> frame) = 0;
-  // False on timeout or error.
+  // False on timeout, error or Wake().
   virtual bool Receive(std::vector<uint8_t>& frame, uint32_t timeout_ms) = 0;
+  // Ends the Receive waiting on another thread, or the next one if none is.
+  // Thread safe.
+  virtual void Wake() = 0;
 };
 
 // Host byte order.

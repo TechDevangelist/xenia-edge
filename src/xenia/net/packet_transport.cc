@@ -100,10 +100,23 @@ class UdpSocket {
     return result;
   }
 
+  // Cancels the ReceiveFor running on another thread, or the next one.
+  void Wake() {
+    woken_ = true;
+    asio::post(io_, [this] {
+      asio::error_code ec;
+      socket_.cancel(ec);
+    });
+  }
+
+  // Whether Wake() was called since the last call.
+  bool TakeWake() { return woken_.exchange(false); }
+
  private:
   asio::io_context io_;
   udp::socket socket_;
   std::vector<uint8_t> buffer_ = std::vector<uint8_t>(65536);
+  std::atomic<bool> woken_{false};
 };
 
 // https://www.teamxlink.co.uk/wiki/Emulator_Integration_Protocol
@@ -148,6 +161,9 @@ class KaiTransport final : public PacketTransport {
   bool Receive(std::vector<uint8_t>& frame, uint32_t timeout_ms) override {
     const uint64_t deadline = Now() + timeout_ms;
     while (healthy_) {
+      if (socket_.TakeWake()) {
+        return false;
+      }
       const uint64_t now = Now();
       if (!connected_ && now >= next_connect_) {
         // The engine may start after us, so keep asking.
@@ -191,6 +207,8 @@ class KaiTransport final : public PacketTransport {
     }
     return false;
   }
+
+  void Wake() override { socket_.Wake(); }
 
  private:
   static constexpr std::string_view kFrameTag = "e;e;";
@@ -256,6 +274,9 @@ class UdpTunnelTransport final : public PacketTransport {
   bool Receive(std::vector<uint8_t>& frame, uint32_t timeout_ms) override {
     const uint64_t deadline = Now() + timeout_ms;
     while (healthy_) {
+      if (socket_.TakeWake()) {
+        return false;
+      }
       const uint64_t now = Now();
       if (now >= deadline) {
         return false;
@@ -292,6 +313,8 @@ class UdpTunnelTransport final : public PacketTransport {
     }
     return false;
   }
+
+  void Wake() override { socket_.Wake(); }
 
  private:
   static constexpr std::string_view kTag = "XESL";

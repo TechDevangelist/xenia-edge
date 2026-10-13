@@ -150,6 +150,8 @@ struct SystemLink::State {
     return config;
   }
 
+  // Only this thread sends and receives on the transport so calls that queue
+  // frames wake it.
   void Run(std::stop_token stop) {
     threading::set_name("XNet System Link");
     while (!stop.stop_requested()) {
@@ -391,6 +393,7 @@ class SystemLink::Port final : public SystemLinkPort {
       error = kWsaMessageSize;
       return -1;
     }
+    state_->transport->Wake();
     return static_cast<int>(bytes.size());
   }
 
@@ -449,6 +452,7 @@ SystemLink::SystemLink(uint32_t address,
 SystemLink::~SystemLink() {
   // Bound ports keep the state alive, but nothing may run it any more.
   state_->worker.request_stop();
+  state_->transport->Wake();
   state_->worker.join();
   Reset();
 }
@@ -490,6 +494,7 @@ uint32_t SystemLink::UnregisterKey(const KeyId& id) {
   }
   // Retiring the associations also drops the datagrams they queued.
   state_->associations.Unregister(id, Now());
+  state_->transport->Wake();
   state_->Deliver();
   std::erase_if(state_->peers,
                 [&](const auto& entry) { return entry.second.key_id == id; });
@@ -537,6 +542,7 @@ uint32_t SystemLink::Unmap(uint32_t secure) {
   // Retiring the association removes the mapping and drops what it queued, a
   // peer that never connected has neither.
   state_->associations.Close(peer.address, peer.key_id, Now());
+  state_->transport->Wake();
   state_->Deliver();
   state_->peers.erase(secure);
   return 0;
@@ -555,6 +561,7 @@ uint32_t SystemLink::Connect(uint32_t secure) {
                                     Now())) {
     return kWsaNoBuffers;
   }
+  state_->transport->Wake();
   return 0;
 }
 

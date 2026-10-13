@@ -51,6 +51,19 @@ class TestTransport : public PacketTransport {
   // Delivers every frame sent from now on twice.
   void Duplicate() { duplicate_ = true; }
 
+  // Receives from now on ignore their timeout, only a frame, Wake() or
+  // Disconnect() ends them.
+  void Stall() { stall_ = true; }
+  int stalled() const { return stalled_; }
+
+  void Wake() override {
+    {
+      std::lock_guard lock(wire_->mutex);
+      woken_ = true;
+    }
+    wire_->changed.notify_all();
+  }
+
   int Send(std::span<const uint8_t> bytes) override {
     std::lock_guard lock(wire_->mutex);
     for (int i = duplicate_ ? 2 : 1; i; --i) {
@@ -62,9 +75,17 @@ class TestTransport : public PacketTransport {
 
   bool Receive(std::vector<uint8_t>& bytes, uint32_t timeout_ms) override {
     std::unique_lock lock(wire_->mutex);
-    wire_->changed.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-      return !healthy_ || !wire_->frames[side_].empty();
-    });
+    auto ready = [&] {
+      return !healthy_ || woken_ || !wire_->frames[side_].empty();
+    };
+    if (stall_) {
+      ++stalled_;
+      wire_->changed.wait(lock, ready);
+    } else {
+      wire_->changed.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                              ready);
+    }
+    woken_ = false;
     if (!healthy_ || wire_->frames[side_].empty()) {
       return false;
     }
@@ -78,6 +99,10 @@ class TestTransport : public PacketTransport {
   unsigned side_;
   std::atomic<bool> healthy_{true};
   std::atomic<bool> duplicate_{false};
+  std::atomic<bool> stall_{false};
+  std::atomic<int> stalled_{0};
+  // Guarded by the wire's mutex.
+  bool woken_ = false;
 };
 
 struct Pair {
@@ -273,6 +298,23 @@ TEST_CASE("System Link delivers a frame that arrives twice once",
   REQUIRE(rx->Receive(buffer, false, source, 2000, error) == 3);
   CHECK(rx->Receive(buffer, false, source, 200, error) == -1);
   CHECK(error == kWsaTimedOut);
+}
+
+TEST_CASE("System Link sends without waiting for a frame to arrive",
+          "[net][system_link]") {
+  Pair pair;
+  auto tx = Bind(*pair.a, 1001, false);
+  auto rx = Bind(*pair.b, 1001, false);
+  REQUIRE(tx);
+  REQUIRE(rx);
+  // The sender's receive now ends only on a frame or a wake.
+  pair.transports[0]->Stall();
+  CHECK(WaitFor([&] { return pair.transports[0]->stalled() > 0; }));
+  const std::vector<uint8_t> data{1, 2, 3};
+  uint32_t error = 0;
+  CHECK(tx->Send({0xFFFFFFFF, 1001}, data, error) == 3);
+  CHECK(Ready(*rx));
+  pair.transports[0]->Disconnect();
 }
 
 TEST_CASE("System Link registry checks key ids", "[net][system_link]") {
