@@ -10,7 +10,17 @@
 #ifndef XENIA_KERNEL_XSESSION_H_
 #define XENIA_KERNEL_XSESSION_H_
 
+#include <memory>
+#include <optional>
+
+#include "xenia/kernel/xobject.h"
+#include "xenia/net/xnet_secure.h"
+
 namespace xe {
+namespace net {
+class SystemLink;
+}  // namespace net
+
 namespace kernel {
 
 enum SessionFlags {
@@ -47,6 +57,37 @@ inline bool IsOfflineSession(const SessionFlags flags) { return !flags; }
 inline bool IsXboxLiveSession(const SessionFlags flags) {
   return !IsOfflineSession(flags) && flags & SessionFlags::LIVE_FEATURES;
 }
+
+struct XSESSION_INFO {
+  net::KeyId session_id;
+  net::secure::Address host_address;
+  net::Key key_exchange_key;
+};
+static_assert_size(XSESSION_INFO, 0x3C);
+
+class XSession : public XObject {
+ public:
+  static const Type kObjectType = Type::Session;
+
+  explicit XSession(KernelState* kernel_state);
+
+  X_STATUS Initialize();
+
+  // The session whose guest body is at |guest_ptr|.
+  static object_ref<XSession> FromGuest(KernelState* kernel_state,
+                                        uint32_t guest_ptr);
+
+  // A host gets a new key and its own XNADDR in the session info. A peer
+  // network session keeps the key registered until DeleteSession, even after
+  // its handle closes.
+  X_RESULT Create(uint32_t flags, uint32_t session_info_ptr,
+                  uint32_t nonce_ptr);
+  X_RESULT DeleteSession();
+
+ private:
+  std::weak_ptr<net::SystemLink> system_link_;
+  std::optional<net::KeyId> registered_key_;
+};
 
 }  // namespace kernel
 }  // namespace xe

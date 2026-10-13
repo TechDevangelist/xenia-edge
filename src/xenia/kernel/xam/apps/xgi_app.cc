@@ -193,8 +193,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x000B0010: {
-      XELOGD("XSessionCreate({:08X}, {:08X}), implemented in netplay",
-             buffer_ptr, buffer_length);
+      XELOGD("XSessionCreate({:08X}, {:08X})", buffer_ptr, buffer_length);
       assert_true(!buffer_length || buffer_length == 28);
       // Sequence:
       // - XamSessionCreateHandle
@@ -226,12 +225,20 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
         return 0x80155209;  // X_ONLINE_E_SESSION_NOT_LOGGED_ON
       }
 
-      return X_E_SUCCESS;
+      auto session = XSession::FromGuest(kernel_state_, session_ptr);
+      if (!session) {
+        return X_E_INVALIDARG;
+      }
+      return session->Create(flags, session_info_ptr, nonce_ptr);
     }
     case 0x000B0011: {
-      XELOGD("XGISessionDelete({:08X}, {:08X}), implemented in netplay",
-             buffer_ptr, buffer_length);
-      return X_STATUS_SUCCESS;
+      XELOGD("XGISessionDelete({:08X}, {:08X})", buffer_ptr, buffer_length);
+      auto session = XSession::FromGuest(kernel_state_,
+                                         xe::load_and_swap<uint32_t>(buffer));
+      if (!session) {
+        return X_E_INVALIDARG;
+      }
+      return session->DeleteSession();
     }
     case 0x000B0012: {
       assert_true(buffer_length == 0x14);
@@ -244,6 +251,19 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_zero(unk_0);
       XELOGD("XGISessionJoinLocal({:08X}, {}, {}, {:08X}, {:08X})", session_ptr,
              user_count, unk_0, user_index_array, private_slots_array);
+      return X_E_SUCCESS;
+    }
+    case 0x000B0013: {
+      assert_true(buffer_length == 0x14);
+      uint32_t session_ptr = xe::load_and_swap<uint32_t>(buffer + 0x0);
+      uint32_t count = xe::load_and_swap<uint32_t>(buffer + 0x4);
+      uint32_t xuid_array = xe::load_and_swap<uint32_t>(buffer + 0x8);
+      uint32_t user_index_array = xe::load_and_swap<uint32_t>(buffer + 0xC);
+
+      // No XUIDs means local users leave by index, otherwise remote users leave
+      // by XUID.
+      XELOGD("XGISessionLeave({:08X}, {}, {:08X}, {:08X})", session_ptr, count,
+             xuid_array, user_index_array);
       return X_E_SUCCESS;
     }
     case 0x000B0014: {

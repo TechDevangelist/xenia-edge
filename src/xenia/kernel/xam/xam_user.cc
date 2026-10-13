@@ -17,6 +17,7 @@
 #include "xenia/kernel/xam/user_settings.h"
 #include "xenia/kernel/xam/xam_private.h"
 #include "xenia/kernel/xenumerator.h"
+#include "xenia/kernel/xsession.h"
 #include "xenia/xbox.h"
 
 #include "third_party/stb/stb_image.h"
@@ -1022,20 +1023,29 @@ dword_result_t XamWriteGamerTile_entry(
 DECLARE_XAM_EXPORT1(XamWriteGamerTile, kUserProfiles, kSketchy);
 
 dword_result_t XamSessionCreateHandle_entry(lpdword_t handle_ptr) {
-  *handle_ptr = 0xCAFEDEAD;
+  auto session = object_ref<XSession>(new XSession(kernel_state()));
+  const X_STATUS result = session->Initialize();
+  if (XFAILED(result)) {
+    return result;
+  }
+  *handle_ptr = session->handle();
   return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamSessionCreateHandle, kUserProfiles, kStub);
+DECLARE_XAM_EXPORT1(XamSessionCreateHandle, kUserProfiles, kImplemented);
 
+// The caller drops the reference with ObDereferenceObject.
 dword_result_t XamSessionRefObjByHandle_entry(dword_t handle,
                                               lpdword_t obj_ptr) {
-  assert_true(handle == 0xCAFEDEAD);
-  // TODO(PermaNull): Implement this properly,
-  // For the time being returning 0xDEADF00D will prevent crashing.
-  *obj_ptr = 0xDEADF00D;
+  *obj_ptr = 0;
+  auto session = kernel_state()->object_table()->LookupObject<XSession>(handle);
+  if (!session) {
+    return X_STATUS_INVALID_HANDLE;
+  }
+  session->RetainHandle();
+  *obj_ptr = session->guest_object();
   return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamSessionRefObjByHandle, kUserProfiles, kStub);
+DECLARE_XAM_EXPORT1(XamSessionRefObjByHandle, kUserProfiles, kImplemented);
 
 dword_result_t XamUserIsUnsafeProgrammingAllowed_entry(dword_t user_index,
                                                        dword_t pc_check,
