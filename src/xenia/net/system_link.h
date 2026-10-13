@@ -40,6 +40,26 @@ struct Endpoint {
   bool operator==(const Endpoint&) const = default;
 };
 
+// XNetQosListen flags.
+inline constexpr uint32_t kQosListenEnable = 0x01;
+inline constexpr uint32_t kQosListenDisable = 0x02;
+inline constexpr uint32_t kQosListenSetData = 0x04;
+inline constexpr uint32_t kQosListenRelease = 0x10;
+// The most data a host answers QoS probes with.
+inline constexpr size_t kQosDataLimit = 256;
+
+struct QosTarget {
+  secure::Address address{};
+  KeyId id{};
+  Key key{};
+};
+
+struct QosResult {
+  bool contacted = false;
+  bool disabled = false;
+  std::vector<uint8_t> data;
+};
+
 struct Peer {
   // The peer's XNADDR as the guest passed it.
   secure::Address address{};
@@ -100,10 +120,25 @@ class SystemLink {
   uint32_t ConnectStatus(uint32_t secure) const;
   std::vector<Peer> peers() const;
 
+  // Sets what this console answers QoS probes for a registered key with.
+  uint32_t QosListen(const KeyId& id, uint32_t flags,
+                     std::span<const uint8_t> data);
+  // Asks the host of each target for the data it listens with. |done| runs
+  // once per target with the System Link locked and must not call back into
+  // it. It runs before this returns for a target that isn't probed, such as
+  // this console's own address, otherwise on the worker. |tag| must not name a
+  // lookup still running.
+  void QosLookup(
+      uint32_t tag, std::vector<QosTarget> targets,
+      std::function<void(size_t target, const QosResult& result)> done);
+  // No |done| of the lookup runs after this returns.
+  void CancelQos(uint32_t tag);
+
   // Port 0 picks a free one.
   std::unique_ptr<SystemLinkPort> Bind(uint16_t port, bool vdp,
                                        uint32_t& error);
-  // Drops every key, peer and association and closes every bound port.
+  // Drops every key, peer, association and QoS listener, ends every QoS lookup
+  // and closes every bound port.
   void Reset();
 
  private:

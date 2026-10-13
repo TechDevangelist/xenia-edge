@@ -8,6 +8,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -90,6 +91,11 @@ struct XNQOSINFO {
   xe::be<uint32_t> down_bits_per_sec;
 };
 static_assert_size(XNQOSINFO, 0x18);
+
+constexpr uint8_t XNET_XNQOSINFO_COMPLETE = 0x01;
+constexpr uint8_t XNET_XNQOSINFO_TARGET_CONTACTED = 0x02;
+constexpr uint8_t XNET_XNQOSINFO_TARGET_DISABLED = 0x04;
+constexpr uint8_t XNET_XNQOSINFO_DATA_RECEIVED = 0x08;
 
 struct XNQOS {
   xe::be<uint32_t> count;
@@ -832,22 +838,141 @@ dword_result_t NetDll_XNetQosServiceLookup_entry(dword_t caller, dword_t flags,
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetQosServiceLookup, kNetworking, kStub);
 
+dword_result_t NetDll_XNetQosLookup_entry(
+    dword_t caller, dword_t xnaddr_count, lpdword_t xnaddrs, lpdword_t xnkids,
+    lpdword_t xnkeys, dword_t gateway_count, lpvoid_t gateways,
+    lpvoid_t service_ids, dword_t probe_count, dword_t bits_per_sec,
+    dword_t flags, dword_t event_handle, lpdword_t qos_ptr) {
+  auto link = GetSystemLink(kernel_state());
+  if (!link) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  // Replies name targets in 16 bits.
+  if (!qos_ptr || xnaddr_count > 0xFFFF || gateway_count > 0xFFFF ||
+      (xnaddr_count && (!xnaddrs || !xnkids || !xnkeys))) {
+    return net::kWsaInvalid;
+  }
+  auto memory = kernel_memory();
+  const xe::be<uint32_t>* addresses = xnaddrs;
+  const xe::be<uint32_t>* ids = xnkids;
+  const xe::be<uint32_t>* keys = xnkeys;
+  std::vector<net::QosTarget> targets(xnaddr_count);
+  for (uint32_t i = 0; i < xnaddr_count; ++i) {
+    if (!addresses[i] || !ids[i] || !keys[i]) {
+      return net::kWsaInvalid;
+    }
+    auto& target = targets[i];
+    std::memcpy(target.address.data(), memory->TranslateVirtual(addresses[i]),
+                target.address.size());
+    std::memcpy(target.id.data(), memory->TranslateVirtual(ids[i]),
+                target.id.size());
+    std::memcpy(target.key.data(), memory->TranslateVirtual(keys[i]),
+                target.key.size());
+  }
+  const uint32_t count = xnaddr_count + gateway_count;
+  // Each host's data follows the entries so XNetQosRelease frees it too.
+  const uint32_t data_offset =
+      offsetof(XNQOS, info) + sizeof(XNQOSINFO) * std::max(count, 1u);
+  const uint32_t size =
+      data_offset + xnaddr_count * uint32_t(net::kQosDataLimit);
+  const uint32_t qos_guest = memory->SystemHeapAlloc(size);
+  if (!qos_guest) {
+    return net::kWsaNoBuffers;
+  }
+  auto qos = memory->TranslateVirtual<XNQOS*>(qos_guest);
+  std::memset(qos, 0, size);
+  qos->count = count;
+  qos->count_pending = uint32_t(xnaddr_count);
+  // A System Link LAN has no Live servers to probe.
+  for (uint32_t i = xnaddr_count; i < count; ++i) {
+    qos->info[i].flags = XNET_XNQOSINFO_COMPLETE;
+  }
+  *qos_ptr = qos_guest;
+  object_ref<XEvent> event;
+  if (event_handle) {
+    event = kernel_state()->object_table()->LookupObject<XEvent>(event_handle);
+  }
+  if (!xnaddr_count) {
+    if (event) {
+      event->Set(0, false);
+    }
+    return 0;
+  }
+  const uint16_t probes = uint16_t(probe_count);
+  auto complete = [memory, qos_guest, data_offset, probes, event](
+                      size_t target, const net::QosResult& result) {
+    auto qos = memory->TranslateVirtual<XNQOS*>(qos_guest);
+    auto& info = qos->info[target];
+    uint8_t info_flags = XNET_XNQOSINFO_COMPLETE;
+    info.probes_xmit = probes;
+    if (result.contacted) {
+      info_flags |= XNET_XNQOSINFO_TARGET_CONTACTED;
+      if (result.disabled) {
+        info_flags |= XNET_XNQOSINFO_TARGET_DISABLED;
+      }
+      // LAN hosts are reported close and fast since the path is not timed.
+      info.probes_recv = probes;
+      info.rtt_min_in_msecs = 1;
+      info.rtt_med_in_msecs = 1;
+      info.up_bits_per_sec = 100000000;
+      info.down_bits_per_sec = 100000000;
+      if (!result.data.empty()) {
+        const uint32_t data_guest =
+            qos_guest + data_offset +
+            uint32_t(target) * uint32_t(net::kQosDataLimit);
+        std::memcpy(memory->TranslateVirtual(data_guest), result.data.data(),
+                    result.data.size());
+        info.data_ptr = data_guest;
+        info.data_len = uint16_t(result.data.size());
+        info_flags |= XNET_XNQOSINFO_DATA_RECEIVED;
+      }
+    }
+    info.flags = info_flags;
+    // Titles poll the pending count, which drops only once the entry is done.
+    std::atomic_thread_fence(std::memory_order_release);
+    qos->count_pending = qos->count_pending - 1;
+    if (event) {
+      event->Set(0, false);
+    }
+  };
+  link->QosLookup(qos_guest, std::move(targets), std::move(complete));
+  return 0;
+}
+DECLARE_XAM_EXPORT1(NetDll_XNetQosLookup, kNetworking, kImplemented);
+
 dword_result_t NetDll_XNetQosRelease_entry(dword_t caller,
                                            pointer_t<XNQOS> qos) {
   if (!qos) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  if (auto link = GetSystemLink(kernel_state())) {
+    link->CancelQos(qos.guest_address());
+  }
   kernel_memory()->SystemHeapFree(qos.guest_address());
   return 0;
 }
-DECLARE_XAM_EXPORT1(NetDll_XNetQosRelease, kNetworking, kStub);
+DECLARE_XAM_EXPORT1(NetDll_XNetQosRelease, kNetworking, kImplemented);
 
 dword_result_t NetDll_XNetQosListen_entry(dword_t caller, lpvoid_t id,
                                           lpvoid_t data, dword_t data_size,
-                                          dword_t r7, dword_t flags) {
-  return X_ERROR_FUNCTION_FAILED;
+                                          dword_t bits_per_sec, dword_t flags) {
+  auto link = GetSystemLink(kernel_state());
+  if (!link) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  if (!id) {
+    return net::kWsaInvalid;
+  }
+  net::KeyId key_id;
+  std::memcpy(key_id.data(), id.as<const uint8_t*>(), key_id.size());
+  std::span<const uint8_t> bytes;
+  if ((flags & net::kQosListenSetData) && data) {
+    bytes = {data.as<const uint8_t*>(),
+             std::min<size_t>(data_size, net::kQosDataLimit)};
+  }
+  return link->QosListen(key_id, flags, bytes);
 }
-DECLARE_XAM_EXPORT1(NetDll_XNetQosListen, kNetworking, kStub);
+DECLARE_XAM_EXPORT1(NetDll_XNetQosListen, kNetworking, kImplemented);
 
 dword_result_t NetDll_inet_addr_entry(lpstring_t addr_ptr) {
   if (!addr_ptr) {

@@ -14,8 +14,10 @@
 #include <deque>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -109,17 +111,19 @@ struct Pair {
   std::shared_ptr<Wire> wire = std::make_shared<Wire>();
   KeyId id{1, 3, 5, 7, 9, 11, 13, 15};
   Key key{2, 4, 6, 8, 10, 12, 14, 16};
+  ProtectionKeys broadcast;
   std::shared_ptr<TestTransport> transports[2];
   std::unique_ptr<SystemLink> a, b;
 
   Pair() {
-    auto broadcast = DeriveBroadcast(key, [&](auto input, auto& digest) {
+    auto derived = DeriveBroadcast(key, [&](auto input, auto& digest) {
       digest = HmacSha1(key, {input});
       return true;
     });
-    REQUIRE(broadcast);
-    a = Make(0, *broadcast);
-    b = Make(1, *broadcast);
+    REQUIRE(derived);
+    broadcast = *derived;
+    a = Make(0, broadcast);
+    b = Make(1, broadcast);
     REQUIRE(a->RegisterKey(id, key) == 0);
     REQUIRE(b->RegisterKey(id, key) == 0);
   }
@@ -160,6 +164,35 @@ bool WaitFor(const std::function<bool()>& condition) {
 bool Ready(SystemLinkPort& port) {
   return WaitFor([&] { return port.Readable(); });
 }
+
+// XNADDR.abEnet.
+constexpr size_t kEnetOffset = 10;
+
+struct QosResults {
+  std::mutex mutex;
+  std::map<size_t, QosResult> results;
+  // Assertions only run on the test thread.
+  size_t repeats = 0;
+
+  ~QosResults() { CHECK(repeats == 0); }
+
+  std::function<void(size_t, const QosResult&)> Done() {
+    return [this](size_t target, const QosResult& result) {
+      std::lock_guard lock(mutex);
+      if (!results.emplace(target, result).second) {
+        ++repeats;
+      }
+    };
+  }
+  size_t Count() {
+    std::lock_guard lock(mutex);
+    return results.size();
+  }
+  QosResult Get(size_t target) {
+    std::lock_guard lock(mutex);
+    return results[target];
+  }
+};
 
 }  // namespace
 
@@ -315,6 +348,205 @@ TEST_CASE("System Link sends without waiting for a frame to arrive",
   CHECK(tx->Send({0xFFFFFFFF, 1001}, data, error) == 3);
   CHECK(Ready(*rx));
   pair.transports[0]->Disconnect();
+}
+
+TEST_CASE("System Link QoS lookups bring back the data a host listens with",
+          "[net][system_link][qos]") {
+  Pair pair;
+  const std::vector<uint8_t> data{9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2,
+                                  3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4};
+  CHECK(pair.a->QosListen(KeyId{2}, kQosListenEnable, {}) == kWsaInvalid);
+  REQUIRE(pair.a->QosListen(pair.id, kQosListenEnable | kQosListenSetData,
+                            data) == 0);
+  const QosTarget host{pair.a->identity(), pair.id, pair.key};
+  QosResults results;
+  pair.b->QosLookup(1, {host, host}, results.Done());
+  REQUIRE(WaitFor([&] { return results.Count() == 2; }));
+  for (size_t target : {0, 1}) {
+    const auto result = results.Get(target);
+    CHECK(result.contacted);
+    CHECK_FALSE(result.disabled);
+    CHECK(result.data == data);
+  }
+
+  // A host that stopped listening still answers with the disabled flag.
+  REQUIRE(pair.a->QosListen(pair.id, kQosListenDisable, {}) == 0);
+  QosResults disabled;
+  pair.b->QosLookup(2, {host}, disabled.Done());
+  REQUIRE(WaitFor([&] { return disabled.Count() == 1; }));
+  CHECK(disabled.Get(0).contacted);
+  CHECK(disabled.Get(0).disabled);
+  CHECK(disabled.Get(0).data == data);
+}
+
+TEST_CASE("System Link QoS lookups give up on hosts that do not answer",
+          "[net][system_link][qos]") {
+  Pair pair;
+  auto absent = pair.a->identity();
+  absent[kEnetOffset + 5] ^= 0x40;
+  QosResults results;
+  // Neither a host that never listened nor an online key gets an answer.
+  KeyId online = pair.id;
+  online[0] |= 0x80;
+  pair.b->QosLookup(1,
+                    {{pair.a->identity(), pair.id, pair.key},
+                     {absent, pair.id, pair.key},
+                     {pair.a->identity(), online, pair.key}},
+                    results.Done());
+  REQUIRE(WaitFor([&] { return results.Count() == 3; }));
+  for (size_t target : {0, 1, 2}) {
+    CHECK_FALSE(results.Get(target).contacted);
+  }
+}
+
+TEST_CASE("System Link answers its own QoS lookups",
+          "[net][system_link][qos]") {
+  Pair pair;
+  const std::vector<uint8_t> data{1, 2, 3};
+  REQUIRE(pair.a->QosListen(pair.id, kQosListenEnable | kQosListenSetData,
+                            data) == 0);
+  QosResults results;
+  pair.a->QosLookup(1, {{pair.a->identity(), pair.id, pair.key}},
+                    results.Done());
+  REQUIRE(results.Count() == 1);
+  CHECK(results.Get(0).contacted);
+  CHECK(results.Get(0).data == data);
+
+  // Releasing the listener leaves nothing to answer with.
+  REQUIRE(pair.a->QosListen(pair.id, kQosListenRelease, {}) == 0);
+  QosResults released;
+  pair.a->QosLookup(2, {{pair.a->identity(), pair.id, pair.key}},
+                    released.Done());
+  REQUIRE(released.Count() == 1);
+  CHECK_FALSE(released.Get(0).contacted);
+}
+
+TEST_CASE("System Link stops a canceled QoS lookup",
+          "[net][system_link][qos]") {
+  Pair pair;
+  auto absent = pair.a->identity();
+  absent[kEnetOffset + 5] ^= 0x40;
+  QosResults results;
+  pair.b->QosLookup(1, {{absent, pair.id, pair.key}}, results.Done());
+  pair.b->CancelQos(1);
+  pair.b->CancelQos(2);
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  CHECK(results.Count() == 0);
+}
+
+TEST_CASE("System Link ends pending QoS lookups when the LAN goes away",
+          "[net][system_link][qos]") {
+  for (bool reset : {true, false}) {
+    Pair pair;
+    QosResults results;
+    // The host never listens so the lookup keeps asking.
+    pair.a->QosLookup(1, {{pair.b->identity(), pair.id, pair.key}},
+                      results.Done());
+    CHECK(results.Count() == 0);
+    if (reset) {
+      pair.a->Reset();
+    } else {
+      pair.transports[0]->Disconnect();
+    }
+    REQUIRE(WaitFor([&] { return results.Count() == 1; }));
+    CHECK_FALSE(results.Get(0).contacted);
+  }
+}
+
+TEST_CASE("System Link answers the QoS probe pairs of a console",
+          "[net][system_link][qos]") {
+  Pair pair;
+  // The test probes in place of the second console.
+  pair.b.reset();
+  const std::vector<uint8_t> data{4, 5, 6, 7, 8};
+  REQUIRE(pair.a->QosListen(pair.id, kQosListenEnable | kQosListenSetData,
+                            data) == 0);
+  const auto keys =
+      DeriveRegistration(pair.broadcast.authentication, pair.id, pair.key);
+  const Mac host = pair.transports[0]->identity();
+  const Mac prober = pair.transports[1]->identity();
+  auto send = [&](const QosProbe& probe) {
+    auto wire = EncodeFrame({prober, host, false, EncodeQosProbe(keys, probe)});
+    REQUIRE(wire);
+    {
+      std::lock_guard lock(pair.wire->mutex);
+      pair.wire->frames[0].push_back(std::move(*wire));
+    }
+    pair.wire->changed.notify_all();
+  };
+  auto receive = [&](uint32_t wait_ms) -> std::optional<QosReply> {
+    std::unique_lock lock(pair.wire->mutex);
+    if (!pair.wire->changed.wait_for(
+            lock, std::chrono::milliseconds(wait_ms),
+            [&] { return !pair.wire->frames[1].empty(); })) {
+      return std::nullopt;
+    }
+    auto wire = std::move(pair.wire->frames[1].front());
+    pair.wire->frames[1].pop_front();
+    auto frame = DecodeFrame(wire);
+    REQUIRE(frame);
+    CHECK(frame->source == host);
+    CHECK(frame->destination == prober);
+    return DecodeQosReply(keys, frame->payload);
+  };
+
+  QosProbe probe;
+  probe.nonce = {1, 2, 3, 4, 5, 6, 7, 8};
+  probe.target = 5;
+  probe.sequence = 1;
+  probe.id = pair.id;
+  probe.address = pair.a->identity();
+  send(probe);
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  probe.flags = kQosProbeSecond;
+  send(probe);
+  const auto first = receive(5000);
+  REQUIRE(first);
+  CHECK(first->nonce == probe.nonce);
+  CHECK(first->target == 5);
+  CHECK(first->sequence == 1);
+  CHECK(first->flags == 0);
+  CHECK(first->delay >= 5000);
+  const auto second = receive(5000);
+  REQUIRE(second);
+  CHECK(second->sequence == 1);
+  // The prober asks for the data next.
+  CHECK(second->flags == kQosReplySecond);
+  CHECK(second->gap >= 5000);
+  CHECK(second->data.empty());
+
+  // A second probe without its first goes unanswered.
+  probe.sequence = 2;
+  send(probe);
+  CHECK_FALSE(receive(300));
+
+  probe.sequence = 3;
+  probe.flags = kQosProbeDataRequest;
+  send(probe);
+  const auto reply = receive(5000);
+  REQUIRE(reply);
+  CHECK(reply->sequence == 3);
+  CHECK(reply->flags == kQosReplyData);
+  CHECK(reply->data == data);
+
+  // Without data the prober is done after the pair.
+  REQUIRE(pair.a->QosListen(pair.id, kQosListenSetData, {}) == 0);
+  probe.sequence = 4;
+  probe.flags = 0;
+  send(probe);
+  probe.flags = kQosProbeSecond;
+  send(probe);
+  REQUIRE(receive(5000));
+  const auto last = receive(5000);
+  REQUIRE(last);
+  CHECK(last->flags == (kQosReplySecond | kQosReplyNoData));
+
+  // Probes name the host they are for.
+  probe.sequence = 5;
+  probe.flags = kQosProbeDataRequest;
+  probe.address[kEnetOffset] ^= 0x40;
+  send(probe);
+  CHECK_FALSE(receive(300));
 }
 
 TEST_CASE("System Link registry checks key ids", "[net][system_link]") {

@@ -146,6 +146,59 @@ std::optional<Exchange> DecodeExchange(const RegistrationKeys& keys,
                                        std::span<const uint8_t> wire);
 bool ResponseMatches(const Exchange& request, const Exchange& response);
 
+// QoS records follow a zero SPI like exchanges and use the registration keys
+// of the key id they name. A prober asks a host for the data it listens with,
+// or times the path with probes sent in pairs.
+inline constexpr uint8_t kQosProbeSecond = 0x01;
+inline constexpr uint8_t kQosProbeDataRequest = 0x02;
+inline constexpr uint8_t kQosReplySecond = 0x01;
+inline constexpr uint8_t kQosReplyData = 0x04;
+// The prober then has no data to ask for.
+inline constexpr uint8_t kQosReplyNoData = 0x08;
+inline constexpr uint8_t kQosReplyDisabled = 0x10;
+
+struct QosProbe {
+  // Per lookup and echoed by replies.
+  Block nonce{};
+  uint16_t target = 0;
+  uint8_t sequence = 0;
+  uint8_t flags = 0;
+  KeyId id{};
+  // The host's XNADDR, which only that host accepts.
+  Address address{};
+};
+
+struct QosReply {
+  Block nonce{};
+  uint16_t target = 0;
+  uint8_t sequence = 0;
+  uint8_t flags = 0;
+  // Microseconds the host held the probe, and between the probes of a pair.
+  uint32_t delay = 0, gap = 0;
+  std::vector<uint8_t> data;
+};
+
+// The clear part of a QoS record, which picks its keys.
+struct QosHeader {
+  bool reply = false;
+  Block nonce{};
+  uint16_t target = 0;
+  // Probes only.
+  KeyId id{};
+};
+
+std::optional<QosHeader> PeekQos(std::span<const uint8_t> wire);
+std::vector<uint8_t> EncodeQosProbe(const RegistrationKeys& keys,
+                                    const QosProbe& probe);
+// Checks the tag and that the address decrypts cleanly. The caller checks
+// that it names this console.
+std::optional<QosProbe> DecodeQosProbe(const RegistrationKeys& keys,
+                                       std::span<const uint8_t> wire);
+std::optional<std::vector<uint8_t>> EncodeQosReply(const RegistrationKeys& keys,
+                                                   const QosReply& reply);
+std::optional<QosReply> DecodeQosReply(const RegistrationKeys& keys,
+                                       std::span<const uint8_t> wire);
+
 // One window per receive direction and generation. Candidates() never changes
 // state, Commit() follows a successful decode.
 class ReplayWindow {
