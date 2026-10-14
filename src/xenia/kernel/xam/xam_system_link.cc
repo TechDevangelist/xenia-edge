@@ -100,9 +100,9 @@ std::unique_ptr<net::secure::PacketTransport> OpenTransport(
   return transport;
 }
 
-bool SystemLinkEnabled() { return cvars::systemlink_transport != "off"; }
-
 }  // namespace
+
+bool SystemLinkEnabled() { return cvars::systemlink_transport != "off"; }
 
 std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state) {
   if (!SystemLinkEnabled()) {

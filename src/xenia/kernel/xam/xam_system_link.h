@@ -21,6 +21,10 @@ class KernelState;
 
 namespace xam {
 
+// Whether System Link is on, which is also whether the console has a network
+// link.
+bool SystemLinkEnabled();
+
 // Starts System Link for the running title over the configured transport.
 // Null when it is off or cannot start.
 std::unique_ptr<net::SystemLink> CreateSystemLink(KernelState* kernel_state);

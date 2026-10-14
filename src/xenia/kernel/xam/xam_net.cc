@@ -741,9 +741,7 @@ struct XEthernetStatus {
 };
 
 dword_result_t NetDll_XNetGetEthernetLinkStatus_entry(dword_t caller) {
-  return GetSystemLink(kernel_state())
-             ? XEthernetStatus::XNET_ETHERNET_LINK_ACTIVE
-             : 0;
+  return SystemLinkEnabled() ? XEthernetStatus::XNET_ETHERNET_LINK_ACTIVE : 0;
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetGetEthernetLinkStatus, kNetworking,
                     kImplemented);

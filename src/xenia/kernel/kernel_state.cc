@@ -20,6 +20,7 @@
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xam/xam_system_link.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_ob.h"
@@ -1104,7 +1105,8 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     // X_ONLINE_S_LOGON_DISCONNECTED
     listener->EnqueueNotification(kXNotificationLiveConnectionChanged,
                                   0x001510F1L);
-    listener->EnqueueNotification(kXNotificationLiveLinkStateChanged, 0);
+    listener->EnqueueNotification(kXNotificationLiveLinkStateChanged,
+                                  xam::SystemLinkEnabled());
   }
 
   if (!has_notified_xmp_startup_ && listener->mask() & kXNotifyXmp) {
