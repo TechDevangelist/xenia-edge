@@ -35,11 +35,16 @@ using udp = asio::ip::udp;
 constexpr uint32_t kLoopback = 0x7F000001;
 constexpr Mac kMacA{2, 17, 34, 51, 68, 1}, kMacB{2, 17, 34, 51, 68, 2};
 
-std::vector<uint8_t> MakeFrame(const Mac& source, uint8_t fill) {
+std::vector<uint8_t> MakeFrameTo(const Mac& source, const Mac& destination,
+                                 uint8_t fill) {
   std::vector<uint8_t> frame(60, fill);
-  std::fill_n(frame.begin(), 6, uint8_t(0xFF));
+  std::copy(destination.begin(), destination.end(), frame.begin());
   std::copy(source.begin(), source.end(), frame.begin() + 6);
   return frame;
+}
+
+std::vector<uint8_t> MakeFrame(const Mac& source, uint8_t fill) {
+  return MakeFrameTo(source, {255, 255, 255, 255, 255, 255}, fill);
 }
 
 std::string Text(std::span<const uint8_t> bytes) {
@@ -119,6 +124,86 @@ TEST_CASE("UDP tunnel carries frames to other instances", "[net][transport]") {
   // Instances on one machine share the port.
   CHECK(OpenUdpTunnelTransport(kMacB, port_a, {}, error));
   CHECK(a->healthy());
+}
+
+TEST_CASE("UDP tunnel sends straight to the peers it heard",
+          "[net][transport]") {
+  // The observer stands in for the rest of the LAN that broadcasts reach.
+  Peer observer;
+  const uint16_t port_a = FreePort();
+  uint16_t port_b = FreePort();
+  while (port_b == port_a) {
+    port_b = FreePort();
+  }
+  std::string error;
+  auto a = OpenUdpTunnelTransport(
+      kMacA, port_a, {{kLoopback, port_b}, {kLoopback, observer.port()}},
+      error);
+  auto b = OpenUdpTunnelTransport(kMacB, port_b, {{kLoopback, port_a}}, error);
+  REQUIRE(a);
+  REQUIRE(b);
+  std::vector<uint8_t> received;
+
+  // Until A hears from B, frames for B go everywhere.
+  const auto early = MakeFrameTo(kMacA, kMacB, 1);
+  REQUIRE(a->Send(early) == static_cast<int>(early.size()));
+  REQUIRE(b->Receive(received, 2000));
+  CHECK(received == early);
+  CHECK(observer.Receive(2000));
+
+  const auto hello = MakeFrame(kMacB, 2);
+  REQUIRE(b->Send(hello) == static_cast<int>(hello.size()));
+  REQUIRE(a->Receive(received, 2000));
+  const auto direct = MakeFrameTo(kMacA, kMacB, 3);
+  REQUIRE(a->Send(direct) == static_cast<int>(direct.size()));
+  REQUIRE(b->Receive(received, 2000));
+  CHECK(received == direct);
+  CHECK_FALSE(observer.Receive(200));
+
+  // Broadcasts still go everywhere.
+  const auto broadcast = MakeFrame(kMacA, 4);
+  REQUIRE(a->Send(broadcast) == static_cast<int>(broadcast.size()));
+  REQUIRE(b->Receive(received, 2000));
+  CHECK(received == broadcast);
+  CHECK(observer.Receive(2000));
+
+  // Instances sharing a port on one machine share an address, which only a
+  // broadcast reaches all of.
+  const Mac mac_c{2, 17, 34, 51, 68, 3}, mac_d{2, 17, 34, 51, 68, 4};
+  Peer shared;
+  for (const auto& mac : {mac_c, mac_d}) {
+    shared.SendTo("XESL" + Text(MakeFrame(mac, 5)),
+                  {asio::ip::address_v4::loopback(), port_a});
+    REQUIRE(a->Receive(received, 2000));
+  }
+  const auto to_shared = MakeFrameTo(kMacA, mac_c, 6);
+  REQUIRE(a->Send(to_shared) == static_cast<int>(to_shared.size()));
+  CHECK(observer.Receive(2000));
+  REQUIRE(b->Receive(received, 2000));
+  CHECK(received == to_shared);
+
+  // A group address can't send, so it can't take broadcasts off the LAN.
+  Peer rogue;
+  rogue.SendTo("XESL" + Text(MakeFrame({255, 255, 255, 255, 255, 255}, 7)),
+               {asio::ip::address_v4::loopback(), port_a});
+  CHECK_FALSE(a->Receive(received, 200));
+  const auto after_rogue = MakeFrame(kMacA, 8);
+  REQUIRE(a->Send(after_rogue) == static_cast<int>(after_rogue.size()));
+  CHECK(observer.Receive(2000));
+  REQUIRE(b->Receive(received, 2000));
+  CHECK(received == after_rogue);
+
+  // An instance that comes back under a new MAC gets frames straight again
+  // once the MACs it had before go quiet.
+  std::this_thread::sleep_for(std::chrono::milliseconds(3200));
+  const Mac mac_e{2, 17, 34, 51, 68, 5};
+  shared.SendTo("XESL" + Text(MakeFrame(mac_e, 9)),
+                {asio::ip::address_v4::loopback(), port_a});
+  REQUIRE(a->Receive(received, 2000));
+  const auto to_restarted = MakeFrameTo(kMacA, mac_e, 10);
+  REQUIRE(a->Send(to_restarted) == static_cast<int>(to_restarted.size()));
+  CHECK(shared.Receive(2000));
+  CHECK_FALSE(observer.Receive(200));
 }
 
 TEST_CASE("Transports stop waiting for a frame when woken",

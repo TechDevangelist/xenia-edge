@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <optional>
 #include <set>
 #include <string_view>
@@ -263,6 +264,17 @@ class UdpTunnelTransport final : public PacketTransport {
     RefreshTargets();
     out_.assign(kTag.begin(), kTag.end());
     out_.insert(out_.end(), frame.begin(), frame.end());
+    if (frame.size() >= kEthernetHeaderSize) {
+      Mac destination;
+      std::copy_n(frame.begin(), destination.size(), destination.begin());
+      if (auto peer = Direct(destination)) {
+        auto ec = socket_.SendTo(out_, *peer);
+        // A peer that can't be reached directly still gets the broadcast.
+        if (!ec || Transient(ec)) {
+          return static_cast<int>(frame.size());
+        }
+      }
+    }
     bool sent = false;
     for (const auto& target : targets_) {
       auto ec = socket_.SendTo(out_, target);
@@ -293,15 +305,28 @@ class UdpTunnelTransport final : public PacketTransport {
         break;
       }
       auto payload = data.subspan(std::min(data.size(), kTag.size()));
-      // Broadcasts come back to the sender too.
       if (data.size() < kTag.size() + kEthernetHeaderSize ||
-          !std::equal(kTag.begin(), kTag.end(), data.begin()) ||
-          std::equal(mac_.begin(), mac_.end(), payload.begin() + 6)) {
+          !std::equal(kTag.begin(), kTag.end(), data.begin())) {
         continue;
       }
       Mac source;
       std::copy_n(payload.begin() + 6, source.size(), source.begin());
-      if (heard_.size() < 256 && heard_.insert(source).second) {
+      // A group address never sends.
+      if (source[0] & 1) {
+        continue;
+      }
+      // Broadcasts come back to the sender too, from its own addresses.
+      if (source == mac_) {
+        if (local_.size() < kPeerLimit) {
+          local_.insert(sender);
+        }
+        continue;
+      }
+      auto peer = peers_.find(source);
+      if (peer != peers_.end()) {
+        peer->second = {sender, Now()};
+      } else if (peers_.size() < kPeerLimit) {
+        peers_.emplace(source, Heard{sender, Now()});
         XELOGI(
             "System Link tunnel: hearing "
             "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} from {}",
@@ -318,6 +343,33 @@ class UdpTunnelTransport final : public PacketTransport {
 
  private:
   static constexpr std::string_view kTag = "XESL";
+  static constexpr size_t kPeerLimit = 256;
+  // A MAC quiet for this long at an address no longer shares it, which is how
+  // a restarted instance's old MAC looks.
+  static constexpr uint64_t kQuietMs = 3000;
+
+  struct Heard {
+    udp::endpoint address;
+    uint64_t at_ms = 0;
+  };
+
+  // Frames go straight to a peer only at an address no other instance shares
+  // since a unicast reaches just one of the instances bound there.
+  std::optional<udp::endpoint> Direct(const Mac& destination) const {
+    auto peer = peers_.find(destination);
+    if ((destination[0] & 1) || peer == peers_.end() ||
+        local_.contains(peer->second.address)) {
+      return std::nullopt;
+    }
+    const uint64_t now = Now();
+    for (const auto& [mac, heard] : peers_) {
+      if (mac != destination && heard.address == peer->second.address &&
+          now - heard.at_ms < kQuietMs) {
+        return std::nullopt;
+      }
+    }
+    return peer->second.address;
+  }
 
   // Windows sends a limited broadcast out of one interface only, which can be
   // a virtual one. Sending to the broadcast address of each subnet reaches
@@ -358,7 +410,10 @@ class UdpTunnelTransport final : public PacketTransport {
   std::vector<UdpEndpoint> destinations_;
   std::vector<udp::endpoint> targets_;
   uint64_t next_refresh_ = 0;
-  std::set<Mac> heard_;
+  // Where and when each peer was last heard.
+  std::map<Mac, Heard> peers_;
+  // The addresses this instance's own broadcasts come back from.
+  std::set<udp::endpoint> local_;
   UdpSocket socket_;
   std::vector<uint8_t> out_;
   std::atomic<bool> healthy_{true};
