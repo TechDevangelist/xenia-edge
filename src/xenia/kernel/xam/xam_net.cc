@@ -527,8 +527,9 @@ dword_result_t NetDll_WSAWaitForMultipleEvents_entry(dword_t num_events,
   X_STATUS result = 0;
   do {
     result = xboxkrnl::xeNtWaitForMultipleObjectsEx(
-        num_events, events, wait_all, 1, alertable,
-        timeout != -1 ? &timeout_wait : nullptr);
+        num_events, events,
+        wait_all ? X_KWAIT_REASON::WaitAll : X_KWAIT_REASON::WaitAny, 1,
+        alertable, timeout != -1 ? &timeout_wait : nullptr);
   } while (result == X_STATUS_ALERTED);
 
   if (XFAILED(result)) {
@@ -536,7 +537,8 @@ dword_result_t NetDll_WSAWaitForMultipleEvents_entry(dword_t num_events,
     XThread::SetLastError(error);
     return ~0u;
   }
-  return 0;
+  // The signaled event's index, WSA_WAIT_TIMEOUT or WSA_WAIT_IO_COMPLETION.
+  return result;
 }
 DECLARE_XAM_EXPORT2(NetDll_WSAWaitForMultipleEvents, kNetworking, kImplemented,
                     kBlocking);
