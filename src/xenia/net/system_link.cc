@@ -51,6 +51,8 @@ constexpr uint64_t kRepeatWindowMs = 500;
 constexpr size_t kRepeatLimit = 512;
 constexpr uint16_t kFirstDynamicPort = 49152;
 constexpr uint32_t kBroadcast = 0xFFFFFFFF;
+// What this console's own XNADDR maps to.
+constexpr uint32_t kLoopback = 0x7F000001;
 // A QoS lookup asks a host this often for its data before giving up.
 constexpr unsigned kQosAttempts = 4;
 constexpr uint64_t kQosRetryMs = 400;
@@ -452,6 +454,11 @@ struct SystemLink::State {
 
   uint32_t Map(const Address& address, const KeyId& id, uint32_t& secure) {
     secure = 0;
+    // This console's own XNADDR maps to loopback with any key.
+    if (Enet(address) == Enet(identity)) {
+      secure = kLoopback;
+      return 0;
+    }
     const uint32_t ina = Ina(address);
     if (!keys.contains(id) || !ina || ina == kBroadcast) {
       return kWsaInvalid;
@@ -513,31 +520,37 @@ struct SystemLink::State {
         // Mapping on Connected shows the peer to the side that accepted.
         continue;
       }
-      const bool vdp = event.packet.kind == Kind::Vdp;
       if (!discovery) {
         XELOGD(
             "System Link datagram received: vdp={}, encrypted={}, clear={}, "
             "source port={}, destination port={}",
-            vdp, event.packet.encrypted.size(), event.packet.clear.size(),
-            event.packet.source_port, event.packet.destination_port);
+            event.packet.kind == Kind::Vdp, event.packet.encrypted.size(),
+            event.packet.clear.size(), event.packet.source_port,
+            event.packet.destination_port);
       }
-      auto data =
-          vdp ? secure::ToGuestVdp(event.packet) : event.packet.encrypted;
-      if (vdp && data.empty()) {
+      Push(event.packet, source);
+    }
+  }
+
+  // Hands |packet| from |source| to the ports bound to its destination.
+  void Push(const Packet& packet, uint32_t source) {
+    const bool discovery = packet.kind == Kind::Discovery;
+    const bool vdp = packet.kind == Kind::Vdp;
+    auto data = vdp ? secure::ToGuestVdp(packet) : packet.encrypted;
+    if (vdp && data.empty()) {
+      return;
+    }
+    for (auto it = ports.begin(); it != ports.end();) {
+      auto inbox = it->second.lock();
+      if (!inbox) {
+        it = ports.erase(it);
         continue;
       }
-      for (auto it = ports.begin(); it != ports.end();) {
-        auto inbox = it->second.lock();
-        if (!inbox) {
-          it = ports.erase(it);
-          continue;
-        }
-        if (it->first.first == event.packet.destination_port &&
-            (discovery || it->first.second == vdp)) {
-          inbox->Push({{source, event.packet.source_port}, data});
-        }
-        ++it;
+      if (it->first.first == packet.destination_port &&
+          (discovery || it->first.second == vdp)) {
+        inbox->Push({{source, packet.source_port}, data});
       }
+      ++it;
     }
   }
 };
@@ -602,8 +615,9 @@ class SystemLink::Port final : public SystemLinkPort {
       packet.encrypted.assign(bytes.begin(), bytes.end());
       sent = state_->associations.Discover(std::move(packet));
     } else {
+      const bool loopback = destination.address == kLoopback;
       auto found = state_->peers.find(destination.address);
-      if (found == state_->peers.end()) {
+      if (!loopback && found == state_->peers.end()) {
         error = kWsaHostUnreachable;
         return -1;
       }
@@ -619,9 +633,17 @@ class SystemLink::Port final : public SystemLinkPort {
         packet.destination_port = destination.port;
         packet.encrypted.assign(bytes.begin(), bytes.end());
       }
-      sent =
-          state_->associations.Send(found->second.address, found->second.key_id,
-                                    std::move(packet), Now());
+      if (loopback) {
+        // No larger than a UDP datagram can be.
+        sent = bytes.size() <= kMaxDatagramSize;
+        if (sent) {
+          state_->Push(packet, kLoopback);
+        }
+      } else {
+        sent = state_->associations.Send(found->second.address,
+                                         found->second.key_id,
+                                         std::move(packet), Now());
+      }
       XELOGD(
           "System Link datagram sent: vdp={}, bytes={}, source port={}, "
           "destination port={}, accepted={}",
@@ -766,6 +788,10 @@ uint32_t SystemLink::Reverse(uint32_t secure, Address& address,
                              KeyId& id) const {
   address = {};
   id = {};
+  if (secure == kLoopback) {
+    address = state_->identity;
+    return 0;
+  }
   std::lock_guard lock(state_->mutex);
   auto found = state_->peers.find(secure);
   if (found == state_->peers.end()) {

@@ -95,6 +95,7 @@ class SystemLinkPort {
 // addresses and the secure associations with them, run over a packet
 // transport. Methods are thread safe. Secure addresses are opaque handles in
 // 0.0.0.0/8 that the guest passes to socket calls in place of a peer's IP.
+// This console's own XNADDR maps to 127.0.0.1.
 class SystemLink {
  public:
   // Fills in |association|'s identity and credential.

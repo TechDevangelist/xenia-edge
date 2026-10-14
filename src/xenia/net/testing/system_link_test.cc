@@ -578,6 +578,62 @@ TEST_CASE("System Link unmaps a peer that never connected",
   CHECK(pair.a->Unmap(address) == kWsaInvalid);
 }
 
+TEST_CASE("System Link loops datagrams to its own address back",
+          "[net][system_link]") {
+  Pair pair;
+  // The key is not looked at.
+  KeyId unregistered = pair.id;
+  unregistered[7] ^= 1;
+  uint32_t address = 0;
+  REQUIRE(pair.a->Map(pair.a->identity(), unregistered, address) == 0);
+  CHECK(address == 0x7F000001);
+  CHECK(pair.a->peers().empty());
+  Address own;
+  KeyId id;
+  REQUIRE(pair.a->Reverse(address, own, id) == 0);
+  CHECK(own == pair.a->identity());
+  CHECK(id == KeyId{});
+  // There is no association to connect or drop.
+  CHECK(pair.a->Connect(address) == kWsaInvalid);
+  CHECK(pair.a->Unmap(address) == kWsaInvalid);
+
+  for (bool vdp : {false, true}) {
+    auto tx = Bind(*pair.a, 1004, vdp);
+    auto rx = Bind(*pair.a, 1005, vdp);
+    auto other_kind = Bind(*pair.a, 1005, !vdp);
+    auto remote = Bind(*pair.b, 1005, vdp);
+    REQUIRE(tx);
+    REQUIRE(rx);
+    REQUIRE(other_kind);
+    REQUIRE(remote);
+    const std::vector<uint8_t> data{0, 2, 7, 8, 9};
+    const int data_size = static_cast<int>(data.size());
+    uint32_t error = 0;
+    REQUIRE(tx->Send({address, 1005}, data, error) == data_size);
+    // A host joins its own session through the port it sends from.
+    REQUIRE(tx->Send({address, 1004}, data, error) == data_size);
+    std::array<uint8_t, 16> buffer{};
+    Endpoint source;
+    REQUIRE(rx->Receive(buffer, false, source, 0, error) == data_size);
+    CHECK(std::equal(data.begin(), data.end(), buffer.begin()));
+    CHECK(source == Endpoint{address, 1004});
+    buffer = {};
+    REQUIRE(tx->Receive(buffer, false, source, 0, error) == data_size);
+    CHECK(std::equal(data.begin(), data.end(), buffer.begin()));
+    CHECK(source == Endpoint{address, 1004});
+    CHECK_FALSE(other_kind->Readable());
+    CHECK(remote->Receive(buffer, false, source, 100, error) == -1);
+    CHECK(error == kWsaTimedOut);
+    if (!vdp) {
+      const std::vector<uint8_t> oversized(kMaxDatagramSize + 1);
+      CHECK(tx->Send({address, 1005}, oversized, error) == -1);
+      CHECK(error == kWsaMessageSize);
+      CHECK_FALSE(rx->Readable());
+    }
+  }
+  CHECK(pair.a->peers().empty());
+}
+
 TEST_CASE("System Link unregistering a key retires its peers",
           "[net][system_link]") {
   Pair pair;
