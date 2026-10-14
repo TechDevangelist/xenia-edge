@@ -750,6 +750,8 @@ X_STATUS XSocket::Listen(int backlog) {
 
 object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
   if (!acceptor_) {
+    // WSAEOPNOTSUPP for a datagram socket, WSAEINVAL before listen().
+    last_error_ = udp_socket_ ? 10045 : uint32_t(X_WSAError::X_WSAEINVAL);
     return nullptr;
   }
 
@@ -790,6 +792,7 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
 
 int XSocket::Shutdown(int how) {
   if (!tcp_socket_ && !udp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
@@ -824,6 +827,7 @@ int XSocket::Shutdown(int how) {
 
 int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
   if (!tcp_socket_ && !udp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
@@ -857,6 +861,7 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                       N_XSOCKADDR_IN* from, uint32_t* from_len) {
   if (!udp_socket_ && !tcp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
@@ -900,6 +905,7 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
 
 int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
   if (!tcp_socket_ && !udp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
@@ -931,6 +937,7 @@ int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                     N_XSOCKADDR_IN* to, uint32_t to_len) {
   if (!udp_socket_ && !tcp_socket_) {
+    last_error_ = 10057;  // WSAENOTCONN
     return -1;
   }
 
