@@ -58,6 +58,21 @@ class TestTransport : public PacketTransport {
   void Stall() { stall_ = true; }
   int stalled() const { return stalled_; }
 
+  // Sends wait from now on until Release() so frames pile up in the System
+  // Link meanwhile.
+  void Hold() {
+    std::lock_guard lock(wire_->mutex);
+    hold_ = true;
+  }
+  void Release() {
+    {
+      std::lock_guard lock(wire_->mutex);
+      hold_ = false;
+    }
+    wire_->changed.notify_all();
+  }
+  int held() const { return held_; }
+
   void Wake() override {
     {
       std::lock_guard lock(wire_->mutex);
@@ -67,7 +82,11 @@ class TestTransport : public PacketTransport {
   }
 
   int Send(std::span<const uint8_t> bytes) override {
-    std::lock_guard lock(wire_->mutex);
+    std::unique_lock lock(wire_->mutex);
+    if (hold_) {
+      ++held_;
+      wire_->changed.wait(lock, [&] { return !hold_ || !healthy_; });
+    }
     for (int i = duplicate_ ? 2 : 1; i; --i) {
       wire_->frames[1 - side_].emplace_back(bytes.begin(), bytes.end());
     }
@@ -103,8 +122,10 @@ class TestTransport : public PacketTransport {
   std::atomic<bool> duplicate_{false};
   std::atomic<bool> stall_{false};
   std::atomic<int> stalled_{0};
+  std::atomic<int> held_{0};
   // Guarded by the wire's mutex.
   bool woken_ = false;
+  bool hold_ = false;
 };
 
 struct Pair {
@@ -576,6 +597,32 @@ TEST_CASE("System Link unmaps a peer that never connected",
   CHECK(pair.a->Reverse(address, peer, id) == kWsaInvalid);
   CHECK(pair.a->peers().empty());
   CHECK(pair.a->Unmap(address) == kWsaInvalid);
+}
+
+TEST_CASE("System Link keeps a peer through a simultaneous connect",
+          "[net][system_link]") {
+  Pair pair;
+  uint32_t to_b, to_a;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, to_b) == 0);
+  REQUIRE(pair.b->Map(pair.a->identity(), pair.id, to_a) == 0);
+  // Both key exchange requests are on their way before either arrives.
+  pair.transports[0]->Hold();
+  pair.transports[1]->Hold();
+  CHECK(pair.a->Connect(to_b) == 0);
+  CHECK(pair.b->Connect(to_a) == 0);
+  CHECK(WaitFor([&] {
+    return pair.transports[0]->held() > 0 && pair.transports[1]->held() > 0;
+  }));
+  pair.transports[0]->Release();
+  pair.transports[1]->Release();
+  CHECK(WaitFor([&] {
+    return pair.a->ConnectStatus(to_b) == 2 && pair.b->ConnectStatus(to_a) == 2;
+  }));
+  Address peer;
+  KeyId id;
+  CHECK(pair.a->Reverse(to_b, peer, id) == 0);
+  CHECK(pair.b->Reverse(to_a, peer, id) == 0);
+  CHECK(peer == pair.a->identity());
 }
 
 TEST_CASE("System Link loops datagrams to its own address back",

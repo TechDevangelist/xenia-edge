@@ -484,6 +484,12 @@ struct SystemLink::State {
   }
 
   void Retire(const Address& address, const KeyId& id) {
+    // A simultaneous connect retires one association and keeps another to the
+    // peer.
+    if (associations.Status(address, id) !=
+        secure::AssociationStatus::Missing) {
+      return;
+    }
     std::erase_if(peers, [&](const auto& entry) {
       if (entry.second.key_id != id || entry.second.address != address) {
         return false;
