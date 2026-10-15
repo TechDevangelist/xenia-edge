@@ -1128,6 +1128,9 @@ dword_result_t NetDll_setsockopt_entry(dword_t caller, dword_t socket_handle,
   }
 
   X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
+  if (XFAILED(status)) {
+    XThread::SetLastError(socket->GetLastWSAError());
+  }
   int result = XSUCCEEDED(status) ? 0 : -1;
   XELOGI("NetDll_setsockopt: {}, returning {}",
          XSUCCEEDED(status) ? "success" : "failed", result);
