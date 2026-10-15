@@ -174,9 +174,14 @@ class XSocket : public XObject {
   // requested Winsock FD_* flags. flags == 0 detaches.
   int WSAEventSelect(object_ref<XEvent> event, uint32_t flags);
 
-  // Bound on the System Link LAN, so there is no host handle to select on.
-  bool system_link() const { return system_link_port_ != nullptr; }
-  bool SystemLinkReadable() const { return system_link_port_->Readable(); }
+  // On the System Link LAN so there is no host handle to select on.
+  bool system_link() const {
+    return system_link_port_ != nullptr || system_link_stream_ != nullptr;
+  }
+  bool SystemLinkReadable() const;
+  bool SystemLinkWritable() const;
+  // A connect failed.
+  bool SystemLinkFailed() const;
 
   uint32_t GetLastWSAError() const;
 
@@ -196,6 +201,9 @@ class XSocket : public XObject {
  private:
   // Private constructor for accepted sockets
   XSocket(KernelState* kernel_state, asio::ip::tcp::socket socket);
+  XSocket(KernelState* kernel_state,
+          std::unique_ptr<net::SystemLinkStream> stream,
+          uint32_t system_link_address);
 
   // Retry shape for RunCooperatively. A connect reports progress through error
   // codes a transfer never sees, and receive and send pick different guest
@@ -210,16 +218,26 @@ class XSocket : public XObject {
   void SetHostNonBlocking(bool enable);
 
   // UDP and VDP sockets bind on the System Link LAN when the title runs it.
+  // TCP sockets of such a title are System Link streams from the start.
   bool UsesSystemLink() const;
   X_STATUS BindSystemLink(uint32_t address, uint16_t port);
   int SystemLinkReceive(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                         N_XSOCKADDR_IN* from, uint32_t* from_len);
   int SystemLinkSend(const uint8_t* buf, uint32_t buf_len,
                      const N_XSOCKADDR_IN* to);
-  // How long a System Link receive waits on this thread.
-  uint32_t SystemLinkWait() const;
+  // A blocking send returns once all of |buf| is queued.
+  int StreamSend(const uint8_t* buf, uint32_t buf_len);
+  X_STATUS StreamConnect(net::Endpoint destination);
+  object_ref<XSocket> StreamAccept(N_XSOCKADDR* name, int* name_len);
+  X_STATUS StreamGetOption(uint32_t level, uint32_t optname, void* optval_ptr,
+                           uint32_t* optlen);
+  // How long a System Link call waits on this thread.
+  uint32_t SystemLinkWait(RetryMode mode) const;
+  // SO_RCVTIMEO and SO_SNDTIMEO, which the retry loop enforces itself.
+  void KeepTimeout(uint32_t level, uint32_t optname, const void* optval_ptr,
+                   uint32_t optlen);
   // Hooks the WSAEventSelect event and the overlapped receives up to the
-  // System Link port. select_mutex_ held.
+  // System Link port or stream. select_mutex_ held.
   void ArmSystemLinkReady();
 
   // Reads the local or remote address into xenia's own layout. Some hosts lay
@@ -264,9 +282,12 @@ class XSocket : public XObject {
   object_ref<XEvent> selected_event_;
   uint32_t selected_event_flags_ = 0;
 
-  // A datagram socket of a title running System Link.
+  // A socket of a title running System Link.
   bool on_system_link_ = false;
   std::unique_ptr<net::SystemLinkPort> system_link_port_;
+  std::unique_ptr<net::SystemLinkStream> system_link_stream_;
+  // SO_LINGER with a zero timeout so closing resets the connection.
+  bool linger_abort_ = false;
   // Overlapped receives, shared with the port's ready callback that completes
   // them on the I/O thread.
   struct OverlappedReceives;

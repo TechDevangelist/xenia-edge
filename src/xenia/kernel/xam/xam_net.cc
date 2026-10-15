@@ -1354,16 +1354,16 @@ struct host_set {
         [](const auto& socket) { return socket->system_link(); });
   }
 
-  // A System Link socket reads once a datagram is queued, can always write
-  // and never has an exception.
+  // A System Link socket answers for itself. Only a stream's failed connect is
+  // an exception.
   bool SystemLinkReady(const XSocket& socket) const {
     switch (this->set) {
       case SelectSet::kRead:
         return socket.SystemLinkReadable();
       case SelectSet::kWrite:
-        return true;
+        return socket.SystemLinkWritable();
       default:
-        return false;
+        return socket.SystemLinkFailed();
     }
   }
 

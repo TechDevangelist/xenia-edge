@@ -25,6 +25,7 @@
 #include "xenia/kernel/xam/xam_system_link.h"
 #include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xthread.h"
+#include "xenia/net/xnet_tcp.h"
 
 namespace xe {
 namespace kernel {
@@ -299,6 +300,19 @@ XSocket::XSocket(KernelState* kernel_state, asio::ip::tcp::socket socket)
   proto_ = Protocol::X_IPPROTO_TCP;
 }
 
+XSocket::XSocket(KernelState* kernel_state,
+                 std::unique_ptr<net::SystemLinkStream> stream,
+                 uint32_t system_link_address)
+    : XObject(kernel_state, kObjectType),
+      af_(AddressFamily::X_AF_INET),
+      type_(Type::X_SOCK_STREAM),
+      proto_(Protocol::X_IPPROTO_TCP),
+      bound_(true),
+      bound_port_(stream->port()),
+      on_system_link_(true),
+      system_link_stream_(std::move(stream)),
+      system_link_address_(system_link_address) {}
+
 XSocket::~XSocket() { Close(); }
 
 uint64_t XSocket::native_handle() {
@@ -326,6 +340,19 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 
   asio::error_code ec;
 
+  const auto link = xam::GetSystemLink(kernel_state_);
+  if (type == Type::X_SOCK_STREAM && link) {
+    uint32_t error = 0;
+    system_link_stream_ = link->CreateStream(error);
+    if (!system_link_stream_) {
+      last_error_ = error;
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    on_system_link_ = true;
+    system_link_address_ = xe::load_and_swap<uint32_t>(link->identity().data());
+    return X_STATUS_SUCCESS;
+  }
+
   if (type == Type::X_SOCK_STREAM) {
     // Use an acceptor for TCP — it supports bind, listen, and accept natively.
     // If Connect() is called later, we transition to a tcp_socket at that
@@ -335,7 +362,7 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
   } else if (type == Type::X_SOCK_DGRAM) {
     udp_socket_.emplace(GetIoContext());
     udp_socket_->open(asio::ip::udp::v4(), ec);
-    on_system_link_ = xam::GetSystemLink(kernel_state_) != nullptr;
+    on_system_link_ = link != nullptr;
   } else {
     return X_STATUS_INVALID_PARAMETER;
   }
@@ -359,9 +386,13 @@ X_STATUS XSocket::Close() {
   if (overlapped_receives_) {
     overlapped_receives_->Close();
   }
+  // Both are kept until destruction since a call on another thread may be in
+  // them.
   if (system_link_port_) {
-    // Kept until destruction since a receive on another thread may be in it.
     system_link_port_->Close();
+  }
+  if (system_link_stream_) {
+    system_link_stream_->Close(linger_abort_);
   }
 
   asio::error_code ec;
@@ -393,6 +424,9 @@ X_STATUS XSocket::Close() {
 
 X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr,
                             uint32_t* optlen) {
+  if (system_link_stream_) {
+    return StreamGetOption(level, optname, optval_ptr, optlen);
+  }
   if (!tcp_socket_ && !udp_socket_ && !acceptor_) {
     last_error_ = AsioErrorToWSAError(asio::error::not_socket);
     return X_STATUS_INVALID_HANDLE;
@@ -440,6 +474,19 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_SUCCESS;
   }
 
+  if (system_link_stream_) {
+    // Buffer sizes, Nagle and the like change nothing the guest sees.
+    KeepTimeout(level, optname, optval_ptr, optlen);
+    // SO_LINGER is two big-endian WORDs, l_onoff and l_linger.
+    if (level == 0xFFFF && optname == 0x0080 && optlen >= 4) {
+      const auto* linger = static_cast<const xe::be<uint16_t>*>(optval_ptr);
+      linger_abort_ = linger[0] && !linger[1];
+    } else if (level == 0xFFFF && optname == ~0x0080u) {
+      linger_abort_ = false;
+    }
+    return X_STATUS_SUCCESS;
+  }
+
   if (!tcp_socket_ && !udp_socket_ && !acceptor_) {
     return X_STATUS_INVALID_HANDLE;
   }
@@ -477,6 +524,12 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     broadcast_socket_ = true;
   }
 
+  KeepTimeout(level, optname, optval_ptr, optlen);
+  return X_STATUS_SUCCESS;
+}
+
+void XSocket::KeepTimeout(uint32_t level, uint32_t optname,
+                          const void* optval_ptr, uint32_t optlen) {
   // SO_SNDTIMEO / SO_RCVTIMEO, a big-endian DWORD of milliseconds. Kept for
   // the cooperative retry loop, which never sees the host option take effect.
   if (level == 0xFFFF && (optname == 0x1005 || optname == 0x1006) &&
@@ -488,11 +541,63 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
       send_timeout_ms_ = timeout_ms;
     }
   }
+}
 
+X_STATUS XSocket::StreamGetOption(uint32_t level, uint32_t optname,
+                                  void* optval_ptr, uint32_t* optlen) {
+  if (*optlen < sizeof(uint32_t)) {
+    last_error_ = uint32_t(X_WSAError::X_WSAEFAULT);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  uint32_t value;
+  if (level == 0xFFFF && optname == 0x1007) {
+    // SO_ERROR, which tells why a non-blocking connect failed.
+    value = system_link_stream_->ConnectError();
+  } else if (level == 0xFFFF && optname == 0x1008) {
+    value = X_SOCK_STREAM;
+  } else if (level == 0xFFFF && (optname == 0x1001 || optname == 0x1002)) {
+    value = uint32_t(net::tcp::kBufferSize);
+  } else if (level == 0xFFFF && optname == 0x1005) {
+    value = send_timeout_ms_;
+  } else if (level == 0xFFFF && optname == 0x1006) {
+    value = recv_timeout_ms_;
+  } else if (level == 0xFFFF && optname == 0x0080) {
+    // SO_LINGER, l_onoff and then l_linger.
+    value = linger_abort_ ? 0x00010000 : 0;
+  } else if (level == 0xFFFF && optname == ~0x0080u) {
+    value = !linger_abort_;
+  } else if (level == 0xFFFF && (optname == 0x0004 || optname == 0x0008 ||
+                                 optname == 0x0020 || optname == 0x0100)) {
+    // SO_REUSEADDR, SO_KEEPALIVE, SO_BROADCAST and SO_OOBINLINE, which no
+    // stream uses.
+    value = 0;
+  } else if (level == X_IPPROTO_TCP && optname == 0x0001) {
+    // Segments always leave right away.
+    value = 1;
+  } else {
+    last_error_ = 10042;  // WSAENOPROTOOPT
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  xe::store_and_swap<uint32_t>(optval_ptr, value);
+  *optlen = sizeof(uint32_t);
   return X_STATUS_SUCCESS;
 }
 
 X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+  if (system_link_stream_) {
+    if (cmd == 0x8004667E) {
+      guest_non_blocking_ = *reinterpret_cast<uint32_t*>(arg_ptr) != 0;
+      return X_STATUS_SUCCESS;
+    }
+    if (cmd == 0x4004667F) {
+      xe::store_and_swap<uint32_t>(
+          arg_ptr, static_cast<uint32_t>(system_link_stream_->PendingBytes()));
+      return X_STATUS_SUCCESS;
+    }
+    XELOGE("XSocket::IOControl: unsupported command {:08X}", cmd);
+    last_error_ = 10022;  // WSAEINVAL
+    return X_STATUS_INVALID_PARAMETER;
+  }
   if (!tcp_socket_ && !udp_socket_ && !acceptor_) {
     return X_STATUS_INVALID_HANDLE;
   }
@@ -616,11 +721,14 @@ void XSocket::RunCooperatively(asio::error_code& ec, RetryMode mode,
 }
 
 X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
+  auto* addr_in = reinterpret_cast<N_XSOCKADDR_IN*>(name);
+  if (system_link_stream_) {
+    return StreamConnect({addr_in->sin_addr, addr_in->sin_port});
+  }
   if (!tcp_socket_ && !udp_socket_ && !acceptor_) {
     return X_STATUS_INVALID_HANDLE;
   }
 
-  auto* addr_in = reinterpret_cast<N_XSOCKADDR_IN*>(name);
   if (UsesSystemLink()) {
     if (!system_link_port_ && BindSystemLink(0, 0) != X_STATUS_SUCCESS) {
       return X_STATUS_UNSUCCESSFUL;
@@ -669,12 +777,11 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+  if (system_link_stream_ || UsesSystemLink()) {
+    return BindSystemLink(name->sin_addr, name->sin_port);
+  }
   if (!tcp_socket_ && !udp_socket_ && !acceptor_) {
     return X_STATUS_INVALID_HANDLE;
-  }
-
-  if (UsesSystemLink()) {
-    return BindSystemLink(name->sin_addr, name->sin_port);
   }
 
   // On Linux and Windows (when running under Wine), ports < 1024 require root
@@ -745,6 +852,13 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
 }
 
 X_STATUS XSocket::Listen(int backlog) {
+  if (system_link_stream_) {
+    if (const uint32_t error = system_link_stream_->Listen(backlog)) {
+      last_error_ = error;
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    return X_STATUS_SUCCESS;
+  }
   if (!acceptor_) {
     return X_STATUS_INVALID_HANDLE;
   }
@@ -782,6 +896,9 @@ static void AcceptedName(N_XSOCKADDR* name, int* name_len,
 }
 
 object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
+  if (system_link_stream_) {
+    return StreamAccept(name, name_len);
+  }
   if (!acceptor_) {
     // WSAEOPNOTSUPP for a datagram socket, WSAEINVAL before listen().
     last_error_ = udp_socket_ ? 10045 : uint32_t(X_WSAError::X_WSAEINVAL);
@@ -814,6 +931,13 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
 }
 
 int XSocket::Shutdown(int how) {
+  if (system_link_stream_) {
+    if (const uint32_t error = system_link_stream_->Shutdown(how)) {
+      last_error_ = error;
+      return -1;
+    }
+    return 0;
+  }
   if (!tcp_socket_ && !udp_socket_) {
     last_error_ = 10057;  // WSAENOTCONN
     return -1;
@@ -849,6 +973,9 @@ int XSocket::Shutdown(int how) {
 }
 
 int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+  if (system_link_stream_) {
+    return SystemLinkReceive(buf, buf_len, flags, nullptr, nullptr);
+  }
   if (!tcp_socket_ && !udp_socket_) {
     last_error_ = 10057;  // WSAENOTCONN
     return -1;
@@ -887,6 +1014,9 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 
 int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                       N_XSOCKADDR_IN* from, uint32_t* from_len) {
+  if (system_link_stream_) {
+    return SystemLinkReceive(buf, buf_len, flags, from, from_len);
+  }
   if (!udp_socket_ && !tcp_socket_) {
     last_error_ = 10057;  // WSAENOTCONN
     return -1;
@@ -935,6 +1065,9 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
 }
 
 int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+  if (system_link_stream_) {
+    return StreamSend(buf, buf_len);
+  }
   if (!tcp_socket_ && !udp_socket_) {
     last_error_ = 10057;  // WSAENOTCONN
     return -1;
@@ -967,6 +1100,10 @@ int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 
 int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                     N_XSOCKADDR_IN* to, uint32_t to_len) {
+  // A connection ignores the destination.
+  if (system_link_stream_) {
+    return StreamSend(buf, buf_len);
+  }
   if (!udp_socket_ && !tcp_socket_) {
     last_error_ = 10057;  // WSAENOTCONN
     return -1;
@@ -1098,7 +1235,7 @@ constexpr uint32_t kWriteEvents = kFD_WRITE | kFD_CONNECT;
 }  // namespace
 
 int XSocket::WSAEventSelect(object_ref<XEvent> event, uint32_t flags) {
-  if (!tcp_socket_ && !udp_socket_ && !acceptor_) {
+  if (!tcp_socket_ && !udp_socket_ && !acceptor_ && !system_link_stream_) {
     last_error_ = uint32_t(X_WSAError::X_WSAENOTSOCK);
     return -1;
   }
@@ -1131,8 +1268,14 @@ int XSocket::WSAEventSelect(object_ref<XEvent> event, uint32_t flags) {
 
   selected_event_ = std::move(event);
   selected_event_flags_ = flags;
+  // Arming clears the event. Readiness that already holds sets it again
+  // below. FD_OOB alone leaves it as is. Host sockets keep theirs since the
+  // I/O thread would only set it again later.
+  if (on_system_link_ && selected_event_ && (flags & ~kFD_OOB)) {
+    selected_event_->Reset();
+  }
 
-  if (system_link_port_) {
+  if (system_link()) {
     ArmSystemLinkReady();
     return 0;
   }
@@ -1192,14 +1335,18 @@ bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port,
 }
 
 X_STATUS XSocket::QueryName(bool peer, N_XSOCKADDR_IN* name) {
-  if (system_link_port_) {
-    if (peer && !system_link_peer_) {
-      last_error_ = 10057;  // WSAENOTCONN
+  if (system_link()) {
+    const auto connected =
+        system_link_stream_ ? system_link_stream_->peer() : system_link_peer_;
+    const uint16_t port =
+        system_link_stream_ ? system_link_stream_->port() : bound_port_;
+    if (peer ? !connected : !port) {
+      // WSAENOTCONN without a connection, WSAEINVAL before a stream binds.
+      last_error_ = peer ? 10057 : 10022;
       return X_STATUS_UNSUCCESSFUL;
     }
     const net::Endpoint endpoint =
-        peer ? *system_link_peer_
-             : net::Endpoint{system_link_address_, bound_port_};
+        peer ? *connected : net::Endpoint{system_link_address_, port};
     name->sin_family = AF_INET;
     name->sin_addr = endpoint.address;
     name->sin_port = endpoint.port;
@@ -1255,6 +1402,15 @@ X_STATUS XSocket::BindSystemLink(uint32_t address, uint16_t port) {
     last_error_ = 10049;  // WSAEADDRNOTAVAIL
     return X_STATUS_UNSUCCESSFUL;
   }
+  if (system_link_stream_) {
+    if (const uint32_t error = system_link_stream_->Bind(port)) {
+      last_error_ = error;
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    bound_port_ = system_link_stream_->port();
+    bound_ = true;
+    return X_STATUS_SUCCESS;
+  }
   uint32_t error = 0;
   auto bound = link->Bind(port, proto_ == Protocol::X_IPPROTO_VDP, error);
   if (!bound) {
@@ -1272,44 +1428,145 @@ X_STATUS XSocket::BindSystemLink(uint32_t address, uint16_t port) {
   return X_STATUS_SUCCESS;
 }
 
+// What RunCooperatively makes of a System Link error so it retries what is
+// still under way.
+static asio::error_code RetryCode(uint32_t error) {
+  switch (error) {
+    case 0:
+      return {};
+    case net::kWsaWouldBlock:
+      return asio::error::would_block;
+    case net::kWsaAlready:
+      return asio::error::already_started;
+    case net::kWsaIsConnected:
+      return asio::error::already_connected;
+    default:
+      return asio::error::fault;
+  }
+}
+
+// The error to report once RunCooperatively ends with |ec|, which is
+// timed_out past SO_RCVTIMEO or SO_SNDTIMEO.
+static uint32_t SystemLinkError(const asio::error_code& ec, uint32_t error) {
+  return ec == asio::error::timed_out ? net::kWsaTimedOut : error;
+}
+
 int XSocket::SystemLinkReceive(uint8_t* buf, uint32_t buf_len, uint32_t flags,
                                N_XSOCKADDR_IN* from, uint32_t* from_len) {
-  if (!system_link_port_) {
+  if (!system_link()) {
     last_error_ = 10022;  // WSAEINVAL
     return -1;
   }
   constexpr uint32_t kMsgPeek = 2;
-  net::Endpoint source;
+  const bool peek = (flags & kMsgPeek) != 0;
+  std::optional<net::Endpoint> source;
   uint32_t error = 0;
   int received = -1;
   asio::error_code ec;
   RunCooperatively(ec, RetryMode::kReceive, [&]() {
-    received =
-        system_link_port_->Receive({buf, buf_len}, (flags & kMsgPeek) != 0,
-                                   source, SystemLinkWait(), error);
-    if (received >= 0) {
-      ec.clear();
-    } else if (error == net::kWsaWouldBlock) {
-      ec = asio::error::would_block;
+    const uint32_t wait_ms = SystemLinkWait(RetryMode::kReceive);
+    if (system_link_stream_) {
+      received =
+          system_link_stream_->Receive({buf, buf_len}, peek, wait_ms, error);
+      source = system_link_stream_->peer();
     } else {
-      ec = asio::error::fault;
+      net::Endpoint datagram;
+      received = system_link_port_->Receive({buf, buf_len}, peek, datagram,
+                                            wait_ms, error);
+      source = datagram;
     }
+    ec = RetryCode(received >= 0 ? 0 : error);
   });
   if (ec) {
-    // RunCooperatively ends a retry past SO_RCVTIMEO with timed_out.
-    last_error_ = ec == asio::error::timed_out ? net::kWsaTimedOut : error;
+    last_error_ = SystemLinkError(ec, error);
     return -1;
   }
-  if (from) {
+  if (from && source) {
     from->sin_family = AF_INET;
-    from->sin_addr = source.address;
-    from->sin_port = source.port;
+    from->sin_addr = source->address;
+    from->sin_port = source->port;
     std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
   }
   if (from_len) {
     *from_len = sizeof(N_XSOCKADDR_IN);
   }
   return received;
+}
+
+int XSocket::StreamSend(const uint8_t* buf, uint32_t buf_len) {
+  uint32_t sent = 0;
+  uint32_t error = 0;
+  asio::error_code ec;
+  RunCooperatively(ec, RetryMode::kSend, [&]() {
+    do {
+      const int written =
+          system_link_stream_->Send({buf + sent, buf_len - sent},
+                                    SystemLinkWait(RetryMode::kSend), error);
+      if (written < 0) {
+        ec = RetryCode(error);
+        return;
+      }
+      sent += uint32_t(written);
+      // A non-blocking send returns what fit.
+    } while (sent < buf_len && !guest_non_blocking_);
+    ec.clear();
+  });
+  if (ec) {
+    last_error_ = SystemLinkError(ec, error);
+    return -1;
+  }
+  return static_cast<int>(sent);
+}
+
+X_STATUS XSocket::StreamConnect(net::Endpoint destination) {
+  uint32_t error = 0;
+  asio::error_code ec;
+  RunCooperatively(ec, RetryMode::kConnect, [&]() {
+    error = system_link_stream_->Connect(destination,
+                                         SystemLinkWait(RetryMode::kConnect));
+    ec = RetryCode(error);
+  });
+  if (ec) {
+    last_error_ = SystemLinkError(ec, error);
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  bound_port_ = system_link_stream_->port();
+  bound_ = true;
+  return X_STATUS_SUCCESS;
+}
+
+object_ref<XSocket> XSocket::StreamAccept(N_XSOCKADDR* name, int* name_len) {
+  net::Endpoint peer;
+  std::unique_ptr<net::SystemLinkStream> accepted;
+  uint32_t error = 0;
+  asio::error_code ec;
+  RunCooperatively(ec, RetryMode::kReceive, [&]() {
+    accepted = system_link_stream_->Accept(
+        peer, SystemLinkWait(RetryMode::kReceive), error);
+    ec = RetryCode(accepted ? 0 : error);
+  });
+  if (!accepted) {
+    last_error_ = SystemLinkError(ec, error);
+    AcceptedName(name, name_len, std::nullopt);
+    return nullptr;
+  }
+  AcceptedName(name, name_len, peer);
+  auto socket = object_ref<XSocket>(
+      new XSocket(kernel_state_, std::move(accepted), system_link_address_));
+  socket->recv_timeout_ms_ = recv_timeout_ms_;
+  socket->send_timeout_ms_ = send_timeout_ms_;
+  socket->linger_abort_ = linger_abort_;
+  // An accepted socket takes over the listener's WSAEventSelect, which makes
+  // it non-blocking as well.
+  std::lock_guard lock(select_mutex_);
+  if (selected_event_ && selected_event_flags_) {
+    std::lock_guard accepted_lock(socket->select_mutex_);
+    socket->guest_non_blocking_ = true;
+    socket->selected_event_ = selected_event_;
+    socket->selected_event_flags_ = selected_event_flags_;
+    socket->ArmSystemLinkReady();
+  }
+  return socket;
 }
 
 int XSocket::SystemLinkSend(const uint8_t* buf, uint32_t buf_len,
@@ -1332,18 +1589,48 @@ int XSocket::SystemLinkSend(const uint8_t* buf, uint32_t buf_len,
   return sent;
 }
 
-uint32_t XSocket::SystemLinkWait() const {
+uint32_t XSocket::SystemLinkWait(RetryMode mode) const {
   // RunCooperatively retries on a fiber so only a host thread waits here.
   if (guest_non_blocking_ || CooperativeThread()) {
     return 0;
   }
-  return recv_timeout_ms_ ? recv_timeout_ms_
-                          : net::SystemLinkPort::kWaitForever;
+  // No socket timeout bounds a connect.
+  const uint32_t timeout_ms = mode == RetryMode::kReceive ? recv_timeout_ms_
+                              : mode == RetryMode::kSend  ? send_timeout_ms_
+                                                          : 0;
+  return timeout_ms ? timeout_ms : net::SystemLinkPort::kWaitForever;
+}
+
+bool XSocket::SystemLinkReadable() const {
+  return system_link_stream_ ? system_link_stream_->Readable()
+                             : system_link_port_->Readable();
+}
+
+bool XSocket::SystemLinkWritable() const {
+  // A datagram socket can always send.
+  return !system_link_stream_ || system_link_stream_->Writable();
+}
+
+bool XSocket::SystemLinkFailed() const {
+  return system_link_stream_ && system_link_stream_->Failed();
 }
 
 void XSocket::ArmSystemLinkReady() {
   auto event = selected_event_;
   const uint32_t flags = event ? selected_event_flags_ : 0;
+  if (system_link_stream_) {
+    // The stream reports FD_* events itself.
+    std::function<void(uint32_t)> ready;
+    if (flags) {
+      ready = [event, flags](uint32_t events) {
+        if (events & flags) {
+          event->Set(0, false);
+        }
+      };
+    }
+    system_link_stream_->SetReadyCallback(std::move(ready));
+    return;
+  }
   system_link_port_->SetReadyCallback(
       [event, flags, receives = overlapped_receives_]() {
         if (flags & kReadEvents) {
