@@ -206,9 +206,9 @@ class XSocket : public XObject {
           uint32_t system_link_address);
 
   // Retry shape for RunCooperatively. A connect reports progress through error
-  // codes a transfer never sees, and receive and send pick different guest
-  // timeouts.
-  enum class RetryMode { kReceive, kSend, kConnect };
+  // codes a transfer never sees. Receive and send each pick a guest timeout
+  // while connect and accept wait without one.
+  enum class RetryMode { kReceive, kSend, kConnect, kAccept };
 
   // Runs |attempt| so the guest still sees a blocking call while the host
   // thread stays free. On a fiber the socket goes non-blocking and we park

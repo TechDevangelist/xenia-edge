@@ -678,8 +678,8 @@ void XSocket::RunCooperatively(asio::error_code& ec, RetryMode mode,
     return;
   }
 
-  // Enforced here because the host option only applies in blocking mode.
-  // Connect is left unbounded, Winsock not applying SO_SNDTIMEO to it.
+  // Enforced here because the host option only applies in blocking mode. No
+  // socket timeout bounds a connect or accept.
   uint32_t timeout_ms = 0;
   if (mode == RetryMode::kReceive) {
     timeout_ms = recv_timeout_ms_;
@@ -693,12 +693,13 @@ void XSocket::RunCooperatively(asio::error_code& ec, RetryMode mode,
     SetHostNonBlocking(true);
   }
   auto* scheduler = self->kernel_state()->guest_scheduler();
-  while (true) {
+  for (bool retried = false;; retried = true) {
     attempt();
     bool retry = ec == asio::error::would_block || ec == asio::error::try_again;
     if (mode == RetryMode::kConnect) {
-      // A retried connect reports success by refusing to connect twice.
-      if (ec == asio::error::already_connected) {
+      // A retried connect reports success by refusing to connect twice. A
+      // socket connected before the call fails with WSAEISCONN.
+      if (ec == asio::error::already_connected && retried) {
         ec.clear();
         break;
       }
@@ -910,7 +911,7 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
   // Accept a new connection
   asio::ip::tcp::socket new_socket(GetIoContext());
   asio::ip::tcp::endpoint peer_endpoint;
-  RunCooperatively(ec, RetryMode::kReceive,
+  RunCooperatively(ec, RetryMode::kAccept,
                    [&]() { acceptor_->accept(new_socket, peer_endpoint, ec); });
 
   if (ec) {
@@ -1540,9 +1541,9 @@ object_ref<XSocket> XSocket::StreamAccept(N_XSOCKADDR* name, int* name_len) {
   std::unique_ptr<net::SystemLinkStream> accepted;
   uint32_t error = 0;
   asio::error_code ec;
-  RunCooperatively(ec, RetryMode::kReceive, [&]() {
+  RunCooperatively(ec, RetryMode::kAccept, [&]() {
     accepted = system_link_stream_->Accept(
-        peer, SystemLinkWait(RetryMode::kReceive), error);
+        peer, SystemLinkWait(RetryMode::kAccept), error);
     ec = RetryCode(accepted ? 0 : error);
   });
   if (!accepted) {
@@ -1594,7 +1595,7 @@ uint32_t XSocket::SystemLinkWait(RetryMode mode) const {
   if (guest_non_blocking_ || CooperativeThread()) {
     return 0;
   }
-  // No socket timeout bounds a connect.
+  // No socket timeout bounds a connect or accept.
   const uint32_t timeout_ms = mode == RetryMode::kReceive ? recv_timeout_ms_
                               : mode == RetryMode::kSend  ? send_timeout_ms_
                                                           : 0;
