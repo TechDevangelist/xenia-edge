@@ -40,8 +40,9 @@ DEFINE_bool(allow_incompatible_title_update, false,
             "Allow title updates with mismatched signatures to be applied.",
             "Kernel");
 
-DEFINE_uint32(kernel_build_version, 1888, "Define current kernel version",
+DEFINE_uint32(kernel_build_version, 17559, "Define current kernel version",
               "Kernel");
+UPDATE_from_uint32(kernel_build_version, 2026, 10, 15, 4, 1888);
 
 DECLARE_string(cl);
 

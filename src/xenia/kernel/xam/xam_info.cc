@@ -345,15 +345,16 @@ dword_result_t XamReadString_entry(dword_t title_id, qword_t id,
 }
 DECLARE_XAM_EXPORT1(XamReadString, kNone, kImplemented);
 
-dword_result_t XamGetSystemVersion_entry() {
-  // eh, just picking one. If we go too low we may break new games, but
-  // this value seems to be used for conditionally loading symbols and if
-  // we pretend to be old we have less to worry with implementing.
-  // 0x200A3200
-  // 0x20096B00
-  return 0;
+// A kernel version packed as 4.4.16.8 bits.
+static uint32_t PackSystemVersion(const KernelVersion& version) {
+  return uint32_t(version.major) << 28 | (uint32_t(version.minor) & 0xF) << 24 |
+         uint32_t(version.build) << 8 | (uint32_t(version.qfe) & 0xFF);
 }
-DECLARE_XAM_EXPORT1(XamGetSystemVersion, kNone, kStub);
+
+dword_result_t XamGetSystemVersion_entry() {
+  return PackSystemVersion(*kernel_state()->GetKernelVersion());
+}
+DECLARE_XAM_EXPORT1(XamGetSystemVersion, kNone, kImplemented);
 
 void XCustomRegisterDynamicActions_entry() {
   // ???
@@ -1183,14 +1184,14 @@ dword_result_t XamLogLocalizationEtx_entry(dword_t error_code, dword_t unk) {
 DECLARE_XAM_EXPORT1(XamLogLocalizationEtx, kNone, kStub);
 
 dword_result_t XamUpdateGetBaseSystemVersion_entry() {
-  return kBaseKernelBuildVersion;
+  return PackSystemVersion(KernelVersion(kBaseKernelBuildVersion));
 }
-DECLARE_XAM_EXPORT1(XamUpdateGetBaseSystemVersion, kNone, kStub);
+DECLARE_XAM_EXPORT1(XamUpdateGetBaseSystemVersion, kNone, kImplemented);
 
 dword_result_t XamUpdateGetCurrentSystemVersion_entry() {
-  return kBaseKernelBuildVersion;
+  return PackSystemVersion(*kernel_state()->GetKernelVersion());
 }
-DECLARE_XAM_EXPORT1(XamUpdateGetCurrentSystemVersion, kNone, kStub);
+DECLARE_XAM_EXPORT1(XamUpdateGetCurrentSystemVersion, kNone, kImplemented);
 
 }  // namespace xam
 }  // namespace kernel
