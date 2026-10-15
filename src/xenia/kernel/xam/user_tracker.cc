@@ -645,7 +645,7 @@ void UserTracker::UpdateContext(uint64_t xuid, uint32_t id, uint32_t value) {
   }
 
   auto user = kernel_state()->xam_state()->GetUserProfile(xuid);
-  if (!user) {
+  if (!user || !spa_data_) {
     return;
   }
 
@@ -681,7 +681,7 @@ std::optional<uint32_t> UserTracker::GetUserContext(uint64_t xuid,
   }
 
   auto user = kernel_state()->xam_state()->GetUserProfile(xuid);
-  if (!user) {
+  if (!user || !spa_data_) {
     return std::nullopt;
   }
 

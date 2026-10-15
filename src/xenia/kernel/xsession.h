@@ -11,7 +11,10 @@
 #define XENIA_KERNEL_XSESSION_H_
 
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include "xenia/kernel/xobject.h"
 #include "xenia/net/xnet_secure.h"
@@ -80,13 +83,56 @@ class XSession : public XObject {
   // A host gets a new key and its own XNADDR in the session info. A peer
   // network session keeps the key registered until DeleteSession, even after
   // its handle closes.
-  X_RESULT Create(uint32_t flags, uint32_t session_info_ptr,
-                  uint32_t nonce_ptr);
+  X_RESULT Create(uint32_t flags, uint32_t user_index,
+                  uint32_t max_public_slots, uint32_t max_private_slots,
+                  uint32_t session_info_ptr, uint32_t nonce_ptr);
   X_RESULT DeleteSession();
+  // Local users join and leave by index, remote ones by XUID.
+  void Join(uint32_t count, uint32_t xuids_ptr, uint32_t user_indices_ptr,
+            uint32_t private_slots_ptr);
+  void Leave(uint32_t count, uint32_t xuids_ptr, uint32_t user_indices_ptr);
+  void Start();
+  void End();
+  X_RESULT Modify(uint32_t flags, uint32_t max_public_slots,
+                  uint32_t max_private_slots);
+  // Fills XSESSION_LOCAL_DETAILS and as many members as fit in the buffer.
+  X_RESULT GetDetails(uint32_t size_ptr, uint32_t details_ptr);
 
  private:
+  enum State : uint32_t {
+    kLobby = 0,
+    kRegistration = 1,
+    kInGame = 2,
+    kReporting = 3,
+    kDeleted = 4,
+  };
+
+  struct Member {
+    uint64_t xuid = 0;
+    uint32_t user_index = 0;
+    bool private_slot = false;
+  };
+
+  // A context of the user who created the session, 0 when unset.
+  uint32_t CreatorContext(uint32_t id) const;
+  // Public and private slots the members take, with mutex_ held.
+  std::pair<uint32_t, uint32_t> UsedSlots() const;
+
   std::weak_ptr<net::SystemLink> system_link_;
   std::optional<net::KeyId> registered_key_;
+
+  // Requests for one session can arrive on several threads.
+  std::mutex mutex_;
+  uint32_t flags_ = 0;
+  uint32_t user_index_ = XUserIndexNone;
+  uint32_t max_public_slots_ = 0;
+  uint32_t max_private_slots_ = 0;
+  uint32_t game_type_ = 0;
+  uint32_t game_mode_ = 0;
+  State state_ = kLobby;
+  uint64_t nonce_ = 0;
+  XSESSION_INFO info_{};
+  std::vector<Member> members_;
 };
 
 }  // namespace kernel

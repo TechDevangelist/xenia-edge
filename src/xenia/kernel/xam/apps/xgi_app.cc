@@ -204,14 +204,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t flags = xe::load_and_swap<uint32_t>(buffer + 0x4);
       uint32_t num_slots_public = xe::load_and_swap<uint32_t>(buffer + 0x8);
       uint32_t num_slots_private = xe::load_and_swap<uint32_t>(buffer + 0xC);
-      uint32_t user_xuid = xe::load_and_swap<uint32_t>(buffer + 0x10);
+      uint32_t user_index = xe::load_and_swap<uint32_t>(buffer + 0x10);
       uint32_t session_info_ptr = xe::load_and_swap<uint32_t>(buffer + 0x14);
       uint32_t nonce_ptr = xe::load_and_swap<uint32_t>(buffer + 0x18);
 
       XELOGD(
           "XGISessionCreateImpl({:08X}, {:08X}, {}, {}, {:08X}, {:08X}, "
           "{:08X})",
-          session_ptr, flags, num_slots_public, num_slots_private, user_xuid,
+          session_ptr, flags, num_slots_public, num_slots_private, user_index,
           session_info_ptr, nonce_ptr);
 
       // 584107FB expects offline session creation using flags 0 to succeed
@@ -229,7 +229,8 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       if (!session) {
         return X_E_INVALIDARG;
       }
-      return session->Create(flags, session_info_ptr, nonce_ptr);
+      return session->Create(flags, user_index, num_slots_public,
+                             num_slots_private, session_info_ptr, nonce_ptr);
     }
     case 0x000B0011: {
       XELOGD("XGISessionDelete({:08X}, {:08X})", buffer_ptr, buffer_length);
@@ -244,13 +245,17 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(buffer_length == 0x14);
       uint32_t session_ptr = xe::load_and_swap<uint32_t>(buffer + 0x0);
       uint32_t user_count = xe::load_and_swap<uint32_t>(buffer + 0x4);
-      uint32_t unk_0 = xe::load_and_swap<uint32_t>(buffer + 0x8);
+      uint32_t xuid_array = xe::load_and_swap<uint32_t>(buffer + 0x8);
       uint32_t user_index_array = xe::load_and_swap<uint32_t>(buffer + 0xC);
       uint32_t private_slots_array = xe::load_and_swap<uint32_t>(buffer + 0x10);
 
-      assert_zero(unk_0);
-      XELOGD("XGISessionJoinLocal({:08X}, {}, {}, {:08X}, {:08X})", session_ptr,
-             user_count, unk_0, user_index_array, private_slots_array);
+      // No user indices means remote users join by XUID.
+      XELOGD("XGISessionJoin({:08X}, {}, {:08X}, {:08X}, {:08X})", session_ptr,
+             user_count, xuid_array, user_index_array, private_slots_array);
+      if (auto session = XSession::FromGuest(kernel_state_, session_ptr)) {
+        session->Join(user_count, xuid_array, user_index_array,
+                      private_slots_array);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0013: {
@@ -260,23 +265,56 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t xuid_array = xe::load_and_swap<uint32_t>(buffer + 0x8);
       uint32_t user_index_array = xe::load_and_swap<uint32_t>(buffer + 0xC);
 
-      // No XUIDs means local users leave by index, otherwise remote users leave
-      // by XUID.
+      // No user indices means remote users leave by XUID.
       XELOGD("XGISessionLeave({:08X}, {}, {:08X}, {:08X})", session_ptr, count,
              xuid_array, user_index_array);
+      if (auto session = XSession::FromGuest(kernel_state_, session_ptr)) {
+        session->Leave(count, xuid_array, user_index_array);
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0014: {
-      // Gets 584107FB in game.
-      // get high score table?
-      XELOGD("XSessionStart({:08X}), implemented in netplay", buffer_ptr);
+      XELOGD("XSessionStart({:08X})", buffer_ptr);
+      if (auto session = XSession::FromGuest(
+              kernel_state_, xe::load_and_swap<uint32_t>(buffer))) {
+        session->Start();
+      }
       return X_STATUS_SUCCESS;
     }
     case 0x000B0015: {
-      // send high scores?
-      XELOGD("XSessionEnd({:08X}, {:08X}), implemented in netplay", buffer_ptr,
-             buffer_length);
+      XELOGD("XSessionEnd({:08X}, {:08X})", buffer_ptr, buffer_length);
+      if (auto session = XSession::FromGuest(
+              kernel_state_, xe::load_and_swap<uint32_t>(buffer))) {
+        session->End();
+      }
       return X_STATUS_SUCCESS;
+    }
+    case 0x000B0018: {
+      assert_true(!buffer_length || buffer_length == 0x10);
+      uint32_t session_ptr = xe::load_and_swap<uint32_t>(buffer + 0x0);
+      uint32_t flags = xe::load_and_swap<uint32_t>(buffer + 0x4);
+      uint32_t max_public_slots = xe::load_and_swap<uint32_t>(buffer + 0x8);
+      uint32_t max_private_slots = xe::load_and_swap<uint32_t>(buffer + 0xC);
+      XELOGD("XSessionModify({:08X}, {:08X}, {}, {})", session_ptr, flags,
+             max_public_slots, max_private_slots);
+      auto session = XSession::FromGuest(kernel_state_, session_ptr);
+      if (!session) {
+        return X_E_INVALIDARG;
+      }
+      return session->Modify(flags, max_public_slots, max_private_slots);
+    }
+    case 0x000B001D: {
+      assert_true(!buffer_length || buffer_length == 0x18);
+      uint32_t session_ptr = xe::load_and_swap<uint32_t>(buffer + 0x0);
+      uint32_t size_ptr = xe::load_and_swap<uint32_t>(buffer + 0x4);
+      uint32_t details_ptr = xe::load_and_swap<uint32_t>(buffer + 0x8);
+      XELOGD("XSessionGetDetails({:08X}, {:08X}, {:08X})", session_ptr,
+             size_ptr, details_ptr);
+      auto session = XSession::FromGuest(kernel_state_, session_ptr);
+      if (!session) {
+        return X_E_INVALIDARG;
+      }
+      return session->GetDetails(size_ptr, details_ptr);
     }
     case 0x000B0021: {
       XELOGD("XUserReadStats");
