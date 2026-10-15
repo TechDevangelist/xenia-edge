@@ -28,6 +28,7 @@
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
+#include "xenia/net/xnet_tcp.h"
 
 namespace xe::net {
 namespace {
@@ -59,6 +60,13 @@ constexpr uint64_t kQosRetryMs = 400;
 // First probes of pairs from other consoles wait this long for the second.
 constexpr auto kQosPairWindow = std::chrono::seconds(2);
 constexpr size_t kQosPairLimit = 256;
+constexpr int kBacklogLimit = 32;
+// A closed socket's connection gets this long to finish before a reset ends
+// it.
+constexpr uint64_t kOrphanMs = 60000;
+// Rounds of segments a console sends itself in one go, each answering the
+// last.
+constexpr unsigned kLoopbackRounds = 64;
 
 uint64_t Now() { return Clock::QueryHostUptimeMillis(); }
 
@@ -139,6 +147,100 @@ struct Inbox {
   }
 };
 
+// Where a TCP connection leads.
+struct Route {
+  Address address{};
+  KeyId id{};
+  // This console's own address, where segments never leave.
+  bool loopback = false;
+  bool operator==(const Route&) const = default;
+};
+
+// What a stream reports, kept to tell which events happened since.
+struct Readiness {
+  size_t readable = 0, acceptable = 0;
+  bool connected = false, writable = false, ended = false, failed = false;
+  uint32_t error = 0;
+  bool operator==(const Readiness&) const = default;
+};
+
+// A guest TCP socket, guarded by the System Link's mutex.
+struct StreamState {
+  uint16_t port = 0;
+  // Holds |port| rather than sharing a listening stream's.
+  bool reserved = false;
+  bool listening = false;
+  size_t backlog = 0;
+  // A listening stream's connections that aren't accepted yet, oldest first.
+  std::deque<std::shared_ptr<StreamState>> pending;
+
+  std::optional<tcp::Connection> connection;
+  Route route;
+  uint16_t remote_port = 0;
+  // The address the guest knows the peer by.
+  uint32_t remote_address = 0;
+
+  bool closed = false, shut_receive = false, shut_send = false;
+  uint64_t closed_at = 0;
+  // What calls fail with once the LAN or the peer went away or the guest
+  // closed the socket.
+  uint32_t error = 0;
+
+  Readiness seen;
+  std::function<void(uint32_t)> ready;
+  // FD_CONNECT went out, which happens once per socket.
+  bool connect_reported = false;
+  std::condition_variable changed;
+};
+
+uint32_t FailureError(tcp::Failure failure) {
+  switch (failure) {
+    case tcp::Failure::Refused:
+      return kWsaConnectionRefused;
+    case tcp::Failure::Reset:
+      return kWsaConnectionReset;
+    case tcp::Failure::TimedOut:
+      return kWsaTimedOut;
+    default:
+      return kWsaConnectionAborted;
+  }
+}
+
+bool ConnectFailed(const StreamState& stream) {
+  return stream.connection && !stream.connection->connected() &&
+         (stream.connection->closed() || stream.error);
+}
+
+Readiness Observe(const StreamState& stream) {
+  Readiness readiness;
+  readiness.error = stream.error;
+  for (const auto& pending : stream.pending) {
+    if (pending->connection->connected() && !pending->connection->closed()) {
+      ++readiness.acceptable;
+    }
+  }
+  if (stream.connection) {
+    const auto& connection = *stream.connection;
+    readiness.readable = connection.readable();
+    readiness.connected = connection.connected();
+    readiness.writable = connection.connected() && !stream.shut_send &&
+                         !stream.error && connection.writable();
+    readiness.ended =
+        connection.connected() && (connection.finished_receiving() ||
+                                   connection.closed() || stream.error);
+    readiness.failed = ConnectFailed(stream);
+  }
+  return readiness;
+}
+
+// The events that hold now, which arming a callback reports.
+uint32_t Level(const Readiness& readiness) {
+  return (readiness.readable ? kStreamRead : 0) |
+         (readiness.acceptable ? kStreamAccept : 0) |
+         (readiness.writable ? kStreamWrite : 0) |
+         (readiness.ended ? kStreamClose : 0);
+}
+
 }  // namespace
 
 struct SystemLink::State {
@@ -174,6 +276,13 @@ struct SystemLink::State {
   Associations associations;
   std::map<std::pair<uint16_t, bool>, std::weak_ptr<Inbox>> ports;
   uint16_t next_port = kFirstDynamicPort;
+  // TCP ports that streams bound.
+  std::map<uint16_t, std::weak_ptr<StreamState>> stream_ports;
+  uint16_t next_stream_port = kFirstDynamicPort;
+  // Listening streams and connections, which segments find their way to.
+  std::vector<std::shared_ptr<StreamState>> streams;
+  // Segments this console sent itself.
+  std::vector<Packet> looped;
   std::map<KeyId, QosListen> qos_listens;
   std::map<uint32_t, QosLookup> qos_lookups;
   std::map<QosPair, std::chrono::steady_clock::time_point> qos_pairs;
@@ -218,6 +327,7 @@ struct SystemLink::State {
           associations.Reset();
           peers.clear();
           CloseInboxes(kWsaNetworkDown);
+          FailStreams(kWsaNetworkDown);
           FinishQos();
           return;
         }
@@ -231,6 +341,7 @@ struct SystemLink::State {
         associations.Tick(Now());
         TickQos(Now());
         Deliver();
+        TickStreams(Now());
         outbound = associations.TakeOutbound();
         std::move(qos_outbound.begin(), qos_outbound.end(),
                   std::back_inserter(outbound));
@@ -501,6 +612,19 @@ struct SystemLink::State {
       }
       return true;
     });
+    // Connections end with the association and nothing reaches the peer any
+    // more to tell it.
+    const Route route{address, id, false};
+    for (auto& stream : streams) {
+      auto& connection = stream->connection;
+      if (!connection || stream->route != route || connection->closed()) {
+        continue;
+      }
+      if (!connection->connected()) {
+        stream->error = kWsaHostUnreachable;
+      }
+      connection->Detach();
+    }
   }
 
   void CloseInboxes(uint32_t error) {
@@ -526,6 +650,10 @@ struct SystemLink::State {
         // Mapping on Connected shows the peer to the side that accepted.
         continue;
       }
+      if (event.packet.kind == Kind::Tcp) {
+        TcpInput({event.peer, event.id, false}, source, event.packet, Now());
+        continue;
+      }
       if (!discovery) {
         XELOGD(
             "System Link datagram received: vdp={}, encrypted={}, clear={}, "
@@ -536,6 +664,7 @@ struct SystemLink::State {
       }
       Push(event.packet, source);
     }
+    FlushStreams(Now());
   }
 
   // Hands |packet| from |source| to the ports bound to its destination.
@@ -557,6 +686,248 @@ struct SystemLink::State {
         inbox->Push({{source, packet.source_port}, data});
       }
       ++it;
+    }
+  }
+
+  // Port 0 picks a free one.
+  uint32_t Reserve(const std::shared_ptr<StreamState>& stream, uint16_t port) {
+    std::erase_if(stream_ports, [](const auto& entry) {
+      auto bound = entry.second.lock();
+      return !bound || bound->closed;
+    });
+    if (stream_ports.size() >= kPortLimit) {
+      return kWsaNoBuffers;
+    }
+    if (!port) {
+      do {
+        port = next_stream_port++;
+        if (!next_stream_port) {
+          next_stream_port = kFirstDynamicPort;
+        }
+      } while (stream_ports.contains(port));
+    } else if (stream_ports.contains(port)) {
+      return kWsaAddressInUse;
+    }
+    stream->port = port;
+    stream->reserved = true;
+    stream_ports[port] = stream;
+    return 0;
+  }
+
+  void Release(StreamState& stream) {
+    if (!stream.reserved) {
+      return;
+    }
+    stream.reserved = false;
+    auto found = stream_ports.find(stream.port);
+    if (found != stream_ports.end() && found->second.lock().get() == &stream) {
+      stream_ports.erase(found);
+    }
+  }
+
+  void SendSegment(const Route& route, const tcp::Segment& segment,
+                   uint16_t source, uint16_t destination, uint64_t now) {
+    auto packet = tcp::ToPacket(segment, source, destination);
+    if (route.loopback) {
+      looped.push_back(std::move(packet));
+      return;
+    }
+    // A segment the association can't take is resent like a lost one.
+    associations.Send(route.address, route.id, std::move(packet), now);
+  }
+
+  // Hands a segment from |route| to its connection, or to a listening stream
+  // when it opens one.
+  void TcpInput(const Route& route, uint32_t source, const Packet& packet,
+                uint64_t now) {
+    auto segment = tcp::FromPacket(packet);
+    if (!segment) {
+      return;
+    }
+    const bool syn =
+        (segment->flags & (tcp::kSyn | tcp::kAck | tcp::kRst)) == tcp::kSyn;
+    for (auto& stream : streams) {
+      auto& connection = stream->connection;
+      if (!connection || connection->closed() ||
+          stream->port != packet.destination_port ||
+          stream->remote_port != packet.source_port || stream->route != route) {
+        continue;
+      }
+      // A new connection may take the ports of one waiting out TIME_WAIT, as
+      // RFC 1122 allows.
+      if (syn && connection->state() == tcp::State::TimeWait) {
+        connection->Detach();
+        break;
+      }
+      connection->Input(*segment, now);
+      return;
+    }
+    if (syn) {
+      for (auto& listener : streams) {
+        if (!listener->listening || listener->port != packet.destination_port) {
+          continue;
+        }
+        // The peer sends its SYN again later.
+        if (listener->pending.size() >= listener->backlog) {
+          return;
+        }
+        auto stream = std::make_shared<StreamState>();
+        stream->port = listener->port;
+        stream->route = route;
+        stream->remote_port = packet.source_port;
+        stream->remote_address = source;
+        stream->connection = tcp::Connection::Answer(*segment, now);
+        // FD_CONNECT is for the side that connects.
+        stream->connect_reported = true;
+        listener->pending.push_back(stream);
+        streams.push_back(std::move(stream));
+        return;
+      }
+    }
+    if (auto reset = tcp::Refusal(*segment)) {
+      XELOGD("System Link TCP: refused a segment for port {}",
+             packet.destination_port);
+      SendSegment(route, *reset, packet.destination_port, packet.source_port,
+                  now);
+    }
+  }
+
+  // Wakes waiting calls when |stream| changed and reports its events along
+  // with those of |again| that still hold. A call that takes only part of
+  // what an event was about reports the event again.
+  void Refresh(StreamState& stream, uint32_t again = 0) {
+    const Readiness now = Observe(stream);
+    const Readiness& before = stream.seen;
+    uint32_t events = again & Level(now);
+    if (now.readable > before.readable) {
+      events |= kStreamRead;
+    }
+    if (now.acceptable > before.acceptable) {
+      events |= kStreamAccept;
+    }
+    if ((now.connected && !before.connected) ||
+        (now.failed && !before.failed)) {
+      events |= kStreamConnect;
+    }
+    if (now.writable && !before.writable) {
+      events |= kStreamWrite;
+    }
+    if (now.ended && !before.ended) {
+      events |= kStreamClose;
+    }
+    if (stream.connection && !stream.closed) {
+      auto peer = [&] {
+        return fmt::format("{:08X}:{}", stream.remote_address,
+                           stream.remote_port);
+      };
+      if (now.connected && !before.connected) {
+        XELOGI("System Link TCP: port {} connected to {}", stream.port, peer());
+      } else if (now.failed && !before.failed) {
+        XELOGI("System Link TCP: port {} failed to connect to {}, error {}",
+               stream.port, peer(),
+               stream.error ? stream.error
+                            : FailureError(stream.connection->failure()));
+      }
+      if (now.ended && !before.ended) {
+        XELOGI(
+            "System Link TCP: connection from port {} to {} ended{}",
+            stream.port, peer(),
+            stream.connection->failure() == tcp::Failure::None && !stream.error
+                ? ""
+                : " abnormally");
+      }
+    }
+    const bool changed = now != before;
+    stream.seen = now;
+    if (changed || events) {
+      stream.changed.notify_all();
+    }
+    if (events && stream.ready) {
+      stream.connect_reported |= (events & kStreamConnect) != 0;
+      stream.ready(events);
+    }
+  }
+
+  // Sends what the connections queued and takes in what they sent this
+  // console, then reports what changed.
+  void FlushStreams(uint64_t now) {
+    for (auto& stream : streams) {
+      auto& connection = stream->connection;
+      if (!stream->closed || !connection || connection->closed()) {
+        continue;
+      }
+      // Nobody reads a closed socket so data that still arrives resets it.
+      // TIME_WAIT ends by itself.
+      if (connection->readable() ||
+          (now - stream->closed_at >= kOrphanMs &&
+           connection->state() != tcp::State::TimeWait)) {
+        connection->Abort();
+      }
+    }
+    for (unsigned round = 0; round < kLoopbackRounds; ++round) {
+      // Input can add streams so they're held while sending.
+      const auto current = streams;
+      for (const auto& stream : current) {
+        if (!stream->connection) {
+          continue;
+        }
+        for (const auto& segment : stream->connection->TakeOutput()) {
+          SendSegment(stream->route, segment, stream->port, stream->remote_port,
+                      now);
+        }
+      }
+      if (looped.empty()) {
+        break;
+      }
+      for (const auto& packet : std::exchange(looped, {})) {
+        TcpInput({{}, {}, true}, kLoopback, packet, now);
+      }
+    }
+    for (auto& stream : streams) {
+      // An accept can't take a connection that ended first.
+      std::erase_if(stream->pending, [](const auto& pending) {
+        return pending->connection->closed();
+      });
+      Refresh(*stream);
+    }
+    // What a closed connection or listener could still do happened above.
+    std::erase_if(streams, [](const auto& stream) {
+      return stream->connection ? stream->connection->closed()
+                                : !stream->listening;
+    });
+  }
+
+  void TickStreams(uint64_t now) {
+    for (auto& stream : streams) {
+      if (stream->connection) {
+        stream->connection->Tick(now);
+      }
+    }
+    FlushStreams(now);
+  }
+
+  void FailStreams(uint32_t error) {
+    auto failed = std::move(streams);
+    streams.clear();
+    for (auto& [port, weak] : stream_ports) {
+      if (auto stream = weak.lock()) {
+        failed.push_back(std::move(stream));
+      }
+    }
+    stream_ports.clear();
+    looped.clear();
+    for (auto& stream : failed) {
+      if (stream->connection) {
+        stream->connection->Abort();
+        stream->connection->TakeOutput();
+      }
+      stream->reserved = false;
+      stream->listening = false;
+      stream->pending.clear();
+      if (!stream->error) {
+        stream->error = error;
+      }
+      Refresh(*stream);
     }
   }
 };
@@ -698,6 +1069,383 @@ class SystemLink::Port final : public SystemLinkPort {
   std::shared_ptr<Inbox> inbox_;
   uint16_t port_;
   bool vdp_;
+};
+
+class SystemLink::Stream final : public SystemLinkStream {
+ public:
+  Stream(std::shared_ptr<State> state, std::shared_ptr<StreamState> stream)
+      : state_(std::move(state)), stream_(std::move(stream)) {}
+  ~Stream() override { Close(false); }
+
+  uint16_t port() const override {
+    std::lock_guard lock(state_->mutex);
+    return stream_->port;
+  }
+
+  std::optional<Endpoint> peer() const override {
+    std::lock_guard lock(state_->mutex);
+    if (!stream_->connection || !stream_->connection->connected()) {
+      return std::nullopt;
+    }
+    return Endpoint{stream_->remote_address, stream_->remote_port};
+  }
+
+  uint32_t Bind(uint16_t port) override {
+    std::lock_guard lock(state_->mutex);
+    if (stream_->error) {
+      return stream_->error;
+    }
+    if (stream_->port) {
+      return kWsaInvalid;
+    }
+    if (!state_->transport->healthy()) {
+      return kWsaNetworkDown;
+    }
+    return state_->Reserve(stream_, port);
+  }
+
+  uint32_t Listen(int backlog) override {
+    std::lock_guard lock(state_->mutex);
+    if (stream_->error) {
+      return stream_->error;
+    }
+    if (stream_->connection) {
+      return kWsaIsConnected;
+    }
+    if (!stream_->port) {
+      return kWsaInvalid;
+    }
+    stream_->backlog = size_t(std::clamp(backlog, 1, kBacklogLimit));
+    if (!stream_->listening) {
+      stream_->listening = true;
+      state_->streams.push_back(stream_);
+    }
+    return 0;
+  }
+
+  std::unique_ptr<SystemLinkStream> Accept(Endpoint& peer, uint32_t wait_ms,
+                                           uint32_t& error) override {
+    std::unique_lock lock(state_->mutex);
+    const auto deadline = Deadline(wait_ms);
+    while (true) {
+      if (stream_->error) {
+        error = stream_->error;
+        return nullptr;
+      }
+      if (!stream_->listening) {
+        error = kWsaInvalid;
+        return nullptr;
+      }
+      auto& pending = stream_->pending;
+      auto ready = std::find_if(
+          pending.begin(), pending.end(),
+          [](auto& entry) { return entry->connection->connected(); });
+      if (ready != pending.end()) {
+        auto accepted = std::move(*ready);
+        pending.erase(ready);
+        peer = {accepted->remote_address, accepted->remote_port};
+        state_->Refresh(*stream_, kStreamAccept);
+        return std::make_unique<Stream>(state_, std::move(accepted));
+      }
+      if (!Wait(lock, wait_ms, deadline)) {
+        error = wait_ms ? kWsaTimedOut : kWsaWouldBlock;
+        return nullptr;
+      }
+    }
+  }
+
+  uint32_t Connect(Endpoint destination, uint32_t wait_ms) override {
+    std::unique_lock lock(state_->mutex);
+    if (stream_->error) {
+      return stream_->error;
+    }
+    if (stream_->listening) {
+      return kWsaInvalid;
+    }
+    if (!stream_->connection) {
+      if (!state_->transport->healthy()) {
+        return kWsaNetworkDown;
+      }
+      Route route;
+      if (destination.address == kLoopback) {
+        route.loopback = true;
+      } else {
+        auto found = state_->peers.find(destination.address);
+        if (found == state_->peers.end()) {
+          return kWsaHostUnreachable;
+        }
+        route = {found->second.address, found->second.key_id, false};
+      }
+      if (!destination.port) {
+        return kWsaAddressNotAvailable;
+      }
+      if (!stream_->port) {
+        if (const uint32_t error = state_->Reserve(stream_, 0)) {
+          return error;
+        }
+      }
+      XELOGI("System Link TCP: port {} connecting to {:08X}:{}", stream_->port,
+             destination.address, destination.port);
+      // A socket closed earlier may still be finishing a connection on these
+      // ports, which this one replaces.
+      for (auto& other : state_->streams) {
+        auto& old = other->connection;
+        if (other->closed && old && !old->closed() &&
+            other->port == stream_->port &&
+            other->remote_port == destination.port && other->route == route) {
+          old->Abort();
+        }
+      }
+      stream_->route = route;
+      stream_->remote_port = destination.port;
+      stream_->remote_address = destination.address;
+      stream_->connection = tcp::Connection::Open(Now());
+      state_->streams.push_back(stream_);
+      state_->FlushStreams(Now());
+      state_->transport->Wake();
+      if (!wait_ms) {
+        return kWsaWouldBlock;
+      }
+    } else if (stream_->connection->connected()) {
+      return kWsaIsConnected;
+    } else if (stream_->connection->connecting() && !wait_ms) {
+      return kWsaAlready;
+    }
+    const auto deadline = Deadline(wait_ms);
+    while (stream_->connection->connecting() && !stream_->error) {
+      if (!Wait(lock, wait_ms, deadline)) {
+        return kWsaTimedOut;
+      }
+    }
+    if (stream_->error) {
+      return stream_->error;
+    }
+    return stream_->connection->connected()
+               ? 0
+               : FailureError(stream_->connection->failure());
+  }
+
+  int Send(std::span<const uint8_t> data, uint32_t wait_ms,
+           uint32_t& error) override {
+    std::unique_lock lock(state_->mutex);
+    const auto deadline = Deadline(wait_ms);
+    while (true) {
+      error = Usable();
+      if (error) {
+        return -1;
+      }
+      auto& connection = *stream_->connection;
+      if (stream_->shut_send) {
+        error = kWsaShutdown;
+        return -1;
+      }
+      if (connection.closed()) {
+        error = FailureError(connection.failure());
+        return -1;
+      }
+      if (data.empty()) {
+        return 0;
+      }
+      if (const size_t written = connection.Write(data, Now())) {
+        state_->FlushStreams(Now());
+        state_->Refresh(*stream_);
+        state_->transport->Wake();
+        return static_cast<int>(written);
+      }
+      if (!Wait(lock, wait_ms, deadline)) {
+        error = wait_ms ? kWsaTimedOut : kWsaWouldBlock;
+        return -1;
+      }
+    }
+  }
+
+  int Receive(std::span<uint8_t> buffer, bool peek, uint32_t wait_ms,
+              uint32_t& error) override {
+    std::unique_lock lock(state_->mutex);
+    const auto deadline = Deadline(wait_ms);
+    while (true) {
+      error = Usable();
+      if (error) {
+        return -1;
+      }
+      auto& connection = *stream_->connection;
+      if (stream_->shut_receive) {
+        error = kWsaShutdown;
+        return -1;
+      }
+      // A reset ends the stream even after the peer's FIN.
+      if (connection.failure() != tcp::Failure::None) {
+        error = FailureError(connection.failure());
+        return -1;
+      }
+      if (connection.readable()) {
+        const size_t read = connection.Read(buffer, peek, Now());
+        state_->FlushStreams(Now());
+        state_->Refresh(*stream_, kStreamRead);
+        state_->transport->Wake();
+        return static_cast<int>(read);
+      }
+      if (connection.finished_receiving() || buffer.empty()) {
+        return 0;
+      }
+      if (connection.closed()) {
+        error = kWsaConnectionAborted;
+        return -1;
+      }
+      if (!Wait(lock, wait_ms, deadline)) {
+        error = wait_ms ? kWsaTimedOut : kWsaWouldBlock;
+        return -1;
+      }
+    }
+  }
+
+  uint32_t Shutdown(int how) override {
+    std::lock_guard lock(state_->mutex);
+    if (const uint32_t error = Usable()) {
+      return error;
+    }
+    if (how < 0 || how > 2) {
+      return kWsaInvalid;
+    }
+    if (how != 1) {
+      stream_->shut_receive = true;
+    }
+    if (how != 0 && !stream_->shut_send) {
+      stream_->shut_send = true;
+      stream_->connection->Finish(Now());
+      state_->FlushStreams(Now());
+      state_->Refresh(*stream_);
+      state_->transport->Wake();
+    }
+    // Calls waiting on this stream now fail.
+    stream_->changed.notify_all();
+    return 0;
+  }
+
+  void Close(bool abort) override {
+    std::lock_guard lock(state_->mutex);
+    if (stream_->closed) {
+      return;
+    }
+    stream_->closed = true;
+    stream_->closed_at = Now();
+    stream_->ready = nullptr;
+    // Connections nobody accepted are refused.
+    for (auto& pending : stream_->pending) {
+      pending->connection->Abort();
+    }
+    stream_->pending.clear();
+    stream_->listening = false;
+    if (auto& connection = stream_->connection) {
+      // Closing with data left to read resets the connection.
+      if (abort || connection->readable() || connection->connecting()) {
+        connection->Abort();
+      } else {
+        connection->Finish(Now());
+      }
+    }
+    state_->Release(*stream_);
+    if (!stream_->error) {
+      stream_->error = kWsaInterrupted;
+    }
+    stream_->changed.notify_all();
+    state_->FlushStreams(Now());
+    state_->transport->Wake();
+  }
+
+  size_t PendingBytes() const override {
+    std::lock_guard lock(state_->mutex);
+    return stream_->connection ? stream_->connection->readable() : 0;
+  }
+
+  bool Readable() const override {
+    std::lock_guard lock(state_->mutex);
+    const Readiness readiness = Observe(*stream_);
+    return readiness.readable || readiness.acceptable || readiness.ended ||
+           readiness.error || stream_->shut_receive;
+  }
+
+  bool Writable() const override {
+    std::lock_guard lock(state_->mutex);
+    return Observe(*stream_).writable;
+  }
+
+  bool Failed() const override {
+    std::lock_guard lock(state_->mutex);
+    return ConnectFailed(*stream_);
+  }
+
+  uint32_t ConnectError() const override {
+    std::lock_guard lock(state_->mutex);
+    if (!ConnectFailed(*stream_)) {
+      return 0;
+    }
+    return stream_->error ? stream_->error
+                          : FailureError(stream_->connection->failure());
+  }
+
+  void SetReadyCallback(std::function<void(uint32_t)> callback) override {
+    std::lock_guard lock(state_->mutex);
+    stream_->ready = std::move(callback);
+    if (!stream_->ready) {
+      return;
+    }
+    const Readiness readiness = Observe(*stream_);
+    uint32_t events = Level(readiness);
+    // How a connect ended is reported once, even to a late arming.
+    if ((readiness.connected || readiness.failed) &&
+        !stream_->connect_reported) {
+      events |= kStreamConnect;
+      stream_->connect_reported = true;
+    }
+    if (events) {
+      stream_->ready(events);
+    }
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+
+  static std::optional<Clock::time_point> Deadline(uint32_t wait_ms) {
+    if (wait_ms == kWaitForever) {
+      return std::nullopt;
+    }
+    return Clock::now() + std::chrono::milliseconds(wait_ms);
+  }
+
+  // Waits for the stream to change. False once no time is left, which the
+  // caller only finds after one more look at the stream.
+  bool Wait(std::unique_lock<std::mutex>& lock, uint32_t wait_ms,
+            const std::optional<Clock::time_point>& deadline) {
+    if (!wait_ms) {
+      return false;
+    }
+    if (!deadline) {
+      stream_->changed.wait(lock);
+      return true;
+    }
+    if (Clock::now() >= *deadline) {
+      return false;
+    }
+    stream_->changed.wait_until(lock, *deadline);
+    return true;
+  }
+
+  // What sending and receiving fail with before looking at the data.
+  uint32_t Usable() const {
+    if (stream_->error) {
+      return stream_->error;
+    }
+    if (!stream_->connection || !stream_->connection->connected()) {
+      return ConnectFailed(*stream_)
+                 ? FailureError(stream_->connection->failure())
+                 : kWsaNotConnected;
+    }
+    return 0;
+  }
+
+  std::shared_ptr<State> state_;
+  std::shared_ptr<StreamState> stream_;
 };
 
 SystemLink::SystemLink(uint32_t address,
@@ -955,6 +1703,15 @@ std::unique_ptr<SystemLinkPort> SystemLink::Bind(uint16_t port, bool vdp,
   return std::make_unique<Port>(state_, std::move(inbox), port, vdp);
 }
 
+std::unique_ptr<SystemLinkStream> SystemLink::CreateStream(uint32_t& error) {
+  std::lock_guard lock(state_->mutex);
+  if (!state_->transport->healthy()) {
+    error = kWsaNetworkDown;
+    return nullptr;
+  }
+  return std::make_unique<Stream>(state_, std::make_shared<StreamState>());
+}
+
 void SystemLink::Reset() {
   std::lock_guard lock(state_->mutex);
   state_->associations.Reset();
@@ -965,6 +1722,7 @@ void SystemLink::Reset() {
   state_->qos_pairs.clear();
   state_->qos_outbound.clear();
   state_->CloseInboxes(kWsaNetworkDown);
+  state_->FailStreams(kWsaNetworkDown);
 }
 
 }  // namespace xe::net

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -28,10 +29,24 @@ inline constexpr uint32_t kWsaWouldBlock = 10035;
 inline constexpr uint32_t kWsaAlready = 10037;
 inline constexpr uint32_t kWsaMessageSize = 10040;
 inline constexpr uint32_t kWsaAddressInUse = 10048;
+inline constexpr uint32_t kWsaAddressNotAvailable = 10049;
 inline constexpr uint32_t kWsaNetworkDown = 10050;
+inline constexpr uint32_t kWsaConnectionAborted = 10053;
+inline constexpr uint32_t kWsaConnectionReset = 10054;
 inline constexpr uint32_t kWsaNoBuffers = 10055;
+inline constexpr uint32_t kWsaIsConnected = 10056;
+inline constexpr uint32_t kWsaNotConnected = 10057;
+inline constexpr uint32_t kWsaShutdown = 10058;
 inline constexpr uint32_t kWsaTimedOut = 10060;
+inline constexpr uint32_t kWsaConnectionRefused = 10061;
 inline constexpr uint32_t kWsaHostUnreachable = 10065;
+
+// FD_* event bits.
+inline constexpr uint32_t kStreamRead = 0x01;
+inline constexpr uint32_t kStreamWrite = 0x02;
+inline constexpr uint32_t kStreamAccept = 0x08;
+inline constexpr uint32_t kStreamConnect = 0x10;
+inline constexpr uint32_t kStreamClose = 0x20;
 
 // Host byte order.
 struct Endpoint {
@@ -91,6 +106,54 @@ class SystemLinkPort {
                       uint32_t wait_ms, uint32_t& error) = 0;
 };
 
+// A guest TCP socket on the System Link LAN. Errors are Winsock codes. Calls
+// that take |wait_ms| wait up to that long to make progress. With 0 they fail
+// with kWsaWouldBlock rather than wait.
+class SystemLinkStream {
+ public:
+  static constexpr uint32_t kWaitForever = UINT32_MAX;
+
+  virtual ~SystemLinkStream() = default;
+  // 0 until bound.
+  virtual uint16_t port() const = 0;
+  // Where a connection leads.
+  virtual std::optional<Endpoint> peer() const = 0;
+  // Port 0 picks a free one.
+  virtual uint32_t Bind(uint16_t port) = 0;
+  virtual uint32_t Listen(int backlog) = 0;
+  virtual std::unique_ptr<SystemLinkStream> Accept(Endpoint& peer,
+                                                   uint32_t wait_ms,
+                                                   uint32_t& error) = 0;
+  // Binds an unbound stream first. A connect still under way fails with
+  // kWsaAlready when called again and one that finished fails with
+  // kWsaIsConnected.
+  virtual uint32_t Connect(Endpoint destination, uint32_t wait_ms) = 0;
+  // Returns how much of |data| was queued.
+  virtual int Send(std::span<const uint8_t> data, uint32_t wait_ms,
+                   uint32_t& error) = 0;
+  // Returns 0 once the peer finished sending.
+  virtual int Receive(std::span<uint8_t> buffer, bool peek, uint32_t wait_ms,
+                      uint32_t& error) = 0;
+  // Winsock's SD_RECEIVE, SD_SEND or SD_BOTH.
+  virtual uint32_t Shutdown(int how) = 0;
+  // The connection finishes in the background, or ends with a reset when
+  // |abort| is set or data was left unread. Calls on other threads return
+  // kWsaInterrupted.
+  virtual void Close(bool abort) = 0;
+  virtual size_t PendingBytes() const = 0;
+  // What select() reports: data, the peer's end or a connection to accept;
+  // room to send on a connection; a connect that failed.
+  virtual bool Readable() const = 0;
+  virtual bool Writable() const = 0;
+  virtual bool Failed() const = 0;
+  // Why a connect failed, 0 if it didn't.
+  virtual uint32_t ConnectError() const = 0;
+  // Runs with the kStream* events that happened and right away with those
+  // that already hold. It must not call back into the System Link.
+  virtual void SetReadyCallback(
+      std::function<void(uint32_t events)> callback) = 0;
+};
+
 // One console on the System Link LAN: its keys, the peers it mapped to secure
 // addresses and the secure associations with them, run over a packet
 // transport. Methods are thread safe. Secure addresses are opaque handles in
@@ -138,16 +201,19 @@ class SystemLink {
   // Port 0 picks a free one.
   std::unique_ptr<SystemLinkPort> Bind(uint16_t port, bool vdp,
                                        uint32_t& error);
+  // An unbound TCP socket. TCP ports are apart from UDP and VDP ones.
+  std::unique_ptr<SystemLinkStream> CreateStream(uint32_t& error);
   // Drops every key, peer, association and QoS listener, ends every QoS lookup
-  // and closes every bound port.
+  // and closes every bound port and stream.
   void Reset();
 
  private:
   struct State;
   class Port;
+  class Stream;
 
   secure::Address identity_{};
-  // Shared with the bound ports, which can outlive this.
+  // Shared with the bound ports and streams, which can outlive this.
   std::shared_ptr<State> state_;
 };
 

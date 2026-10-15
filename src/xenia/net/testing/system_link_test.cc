@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "xenia/net/system_link.h"
+#include "xenia/net/xnet_tcp.h"
 
 #include "third_party/catch/include/catch.hpp"
 
@@ -184,6 +185,59 @@ bool WaitFor(const std::function<bool()>& condition) {
 
 bool Ready(SystemLinkPort& port) {
   return WaitFor([&] { return port.Readable(); });
+}
+
+std::unique_ptr<SystemLinkStream> Stream(SystemLink& link) {
+  uint32_t error = 0;
+  auto stream = link.CreateStream(error);
+  CHECK(error == 0);
+  return stream;
+}
+
+std::unique_ptr<SystemLinkStream> Listen(SystemLink& link, uint16_t port) {
+  auto stream = Stream(link);
+  REQUIRE(stream);
+  REQUIRE(stream->Bind(port) == 0);
+  REQUIRE(stream->Listen(5) == 0);
+  return stream;
+}
+
+constexpr uint32_t kWait = 5000;
+
+// Reads until |size| bytes arrived or the stream ends.
+std::vector<uint8_t> ReceiveAll(SystemLinkStream& stream, size_t size) {
+  std::vector<uint8_t> received;
+  std::array<uint8_t, 1500> buffer;
+  while (received.size() < size) {
+    uint32_t error = 0;
+    const int read = stream.Receive(buffer, false, kWait, error);
+    if (read <= 0) {
+      break;
+    }
+    received.insert(received.end(), buffer.begin(), buffer.begin() + read);
+  }
+  return received;
+}
+
+// Runs on other threads too so it asserts nothing itself.
+bool SendAll(SystemLinkStream& stream, std::span<const uint8_t> data) {
+  while (!data.empty()) {
+    uint32_t error = 0;
+    const int sent = stream.Send(data, kWait, error);
+    if (sent <= 0) {
+      return false;
+    }
+    data = data.subspan(sent);
+  }
+  return true;
+}
+
+std::vector<uint8_t> Pattern(size_t size, uint8_t seed) {
+  std::vector<uint8_t> bytes(size);
+  for (size_t i = 0; i < size; ++i) {
+    bytes[i] = uint8_t(seed + i * 13);
+  }
+  return bytes;
 }
 
 // XNADDR.abEnet.
@@ -741,6 +795,446 @@ TEST_CASE(
   Key key;
   CHECK(pair.a->GetKey(pair.id, key));
   CHECK(key == pair.key);
+}
+
+TEST_CASE("System Link streams connect, carry data and close",
+          "[net][system_link][tcp]") {
+  for (bool reverse : {false, true}) {
+    Pair pair;
+    auto& client_link = reverse ? *pair.b : *pair.a;
+    auto& host_link = reverse ? *pair.a : *pair.b;
+    auto listener = Listen(host_link, 1003);
+    uint32_t host;
+    REQUIRE(client_link.Map(host_link.identity(), pair.id, host) == 0);
+    auto client = Stream(client_link);
+    REQUIRE(client);
+    CHECK_FALSE(client->peer());
+    REQUIRE(client->Connect({host, 1003}, kWait) == 0);
+    CHECK(client->port() >= 49152);
+    CHECK(client->peer() == Endpoint{host, 1003});
+    CHECK(client->Connect({host, 1003}, kWait) == kWsaIsConnected);
+
+    Endpoint source;
+    uint32_t error = 0;
+    auto accepted = listener->Accept(source, kWait, error);
+    REQUIRE(accepted);
+    CHECK(source.port == client->port());
+    CHECK(accepted->port() == 1003);
+    CHECK(accepted->peer() == source);
+    Address peer;
+    KeyId id;
+    REQUIRE(host_link.Reverse(source.address, peer, id) == 0);
+    CHECK(peer == client_link.identity());
+
+    const auto request = Pattern(5000, 1);
+    REQUIRE(SendAll(*client, request));
+    CHECK(ReceiveAll(*accepted, request.size()) == request);
+    const auto reply = Pattern(7, 3);
+    REQUIRE(SendAll(*accepted, reply));
+    CHECK(ReceiveAll(*client, reply.size()) == reply);
+
+    // The client finishes sending, the host still answers.
+    REQUIRE(client->Shutdown(1) == 0);
+    std::array<uint8_t, 16> buffer;
+    CHECK(accepted->Receive(buffer, false, kWait, error) == 0);
+    CHECK(client->Send(reply, 0, error) == -1);
+    CHECK(error == kWsaShutdown);
+    REQUIRE(SendAll(*accepted, reply));
+    CHECK(ReceiveAll(*client, reply.size()) == reply);
+    accepted->Close(false);
+    CHECK(client->Receive(buffer, false, kWait, error) == 0);
+    CHECK(accepted->Receive(buffer, false, 0, error) == -1);
+    CHECK(error == kWsaInterrupted);
+  }
+}
+
+TEST_CASE("System Link streams carry more than a window",
+          "[net][system_link][tcp]") {
+  Pair pair;
+  auto listener = Listen(*pair.b, 28001);
+  uint32_t host;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, host) == 0);
+  auto client = Stream(*pair.a);
+  REQUIRE(client->Connect({host, 28001}, kWait) == 0);
+  Endpoint source;
+  uint32_t error = 0;
+  auto accepted = listener->Accept(source, kWait, error);
+  REQUIRE(accepted);
+  const auto data = Pattern(300000, 7);
+  auto sending =
+      std::async(std::launch::async, [&] { return SendAll(*client, data); });
+  CHECK(ReceiveAll(*accepted, data.size()) == data);
+  CHECK(sending.get());
+}
+
+TEST_CASE("System Link streams refuse ports nobody listens on",
+          "[net][system_link][tcp]") {
+  Pair pair;
+  uint32_t host;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, host) == 0);
+  auto client = Stream(*pair.a);
+  CHECK(client->Connect({host, 1004}, kWait) == kWsaConnectionRefused);
+  CHECK(client->Failed());
+  CHECK(client->ConnectError() == kWsaConnectionRefused);
+  uint32_t error = 0;
+  std::array<uint8_t, 4> buffer;
+  CHECK(client->Receive(buffer, false, 0, error) == -1);
+  CHECK(error == kWsaConnectionRefused);
+
+  // Nor does an address that maps to no peer lead anywhere.
+  auto lost = Stream(*pair.a);
+  CHECK(lost->Connect({0x00000777, 1003}, kWait) == kWsaHostUnreachable);
+  CHECK(lost->Connect({host, 0}, kWait) == kWsaAddressNotAvailable);
+}
+
+TEST_CASE("System Link streams report readiness as Winsock events",
+          "[net][system_link][tcp]") {
+  Pair pair;
+  auto listener = Listen(*pair.b, 1003);
+  std::atomic<uint32_t> listener_events{0};
+  listener->SetReadyCallback(
+      [&](uint32_t events) { listener_events |= events; });
+  CHECK(listener_events.load() == 0);
+  CHECK_FALSE(listener->Readable());
+  Endpoint source;
+  uint32_t error = 0;
+  CHECK_FALSE(listener->Accept(source, 0, error));
+  CHECK(error == kWsaWouldBlock);
+
+  uint32_t host;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, host) == 0);
+  auto client = Stream(*pair.a);
+  std::atomic<uint32_t> client_events{0};
+  client->SetReadyCallback([&](uint32_t events) { client_events |= events; });
+  // The connect stays under way while its key exchange is held back.
+  pair.transports[0]->Hold();
+  CHECK(client->Connect({host, 1003}, 0) == kWsaWouldBlock);
+  CHECK(client->Connect({host, 1003}, 0) == kWsaAlready);
+  CHECK_FALSE(client->Writable());
+  std::array<uint8_t, 8> buffer;
+  CHECK(client->Send(buffer, 0, error) == -1);
+  CHECK(error == kWsaNotConnected);
+  pair.transports[0]->Release();
+  REQUIRE(WaitFor([&] {
+    return (client_events.load() & (kStreamConnect | kStreamWrite)) ==
+           (kStreamConnect | kStreamWrite);
+  }));
+  CHECK(client->Writable());
+  CHECK(client->Connect({host, 1003}, 0) == kWsaIsConnected);
+  REQUIRE(WaitFor([&] { return listener_events.load() & kStreamAccept; }));
+  CHECK(listener->Readable());
+  auto accepted = listener->Accept(source, 0, error);
+  REQUIRE(accepted);
+  CHECK_FALSE(listener->Readable());
+
+  std::atomic<uint32_t> host_events{0};
+  accepted->SetReadyCallback([&](uint32_t events) { host_events |= events; });
+  // Arming reports what holds already.
+  CHECK(host_events.load() == kStreamWrite);
+  host_events = 0;
+  CHECK(accepted->Receive(buffer, false, 0, error) == -1);
+  CHECK(error == kWsaWouldBlock);
+  const auto data = Pattern(6, 2);
+  REQUIRE(SendAll(*client, data));
+  REQUIRE(WaitFor([&] { return host_events.load() & kStreamRead; }));
+  CHECK(accepted->PendingBytes() == data.size());
+  host_events = 0;
+  // A read that leaves data behind reports it again.
+  CHECK(accepted->Receive(std::span(buffer).first(2), true, 0, error) == 2);
+  CHECK(accepted->Receive(std::span(buffer).first(2), false, 0, error) == 2);
+  CHECK(buffer[0] == data[0]);
+  CHECK(host_events.load() == kStreamRead);
+  host_events = 0;
+  CHECK(accepted->Receive(buffer, false, 0, error) == 4);
+  CHECK(host_events.load() == 0);
+  CHECK_FALSE(accepted->Readable());
+
+  client->Close(false);
+  REQUIRE(WaitFor([&] { return host_events.load() & kStreamClose; }));
+  CHECK(accepted->Readable());
+  CHECK(accepted->Receive(buffer, false, 0, error) == 0);
+}
+
+TEST_CASE("System Link streams loop back to this console",
+          "[net][system_link][tcp]") {
+  Pair pair;
+  auto listener = Listen(*pair.a, 1003);
+  uint32_t self;
+  REQUIRE(pair.a->Map(pair.a->identity(), pair.id, self) == 0);
+  auto client = Stream(*pair.a);
+  REQUIRE(client->Connect({self, 1003}, kWait) == 0);
+  Endpoint source;
+  uint32_t error = 0;
+  auto accepted = listener->Accept(source, kWait, error);
+  REQUIRE(accepted);
+  CHECK(source == Endpoint{self, client->port()});
+  const auto data = Pattern(100000, 9);
+  auto sending =
+      std::async(std::launch::async, [&] { return SendAll(*client, data); });
+  CHECK(ReceiveAll(*accepted, data.size()) == data);
+  CHECK(sending.get());
+  client->Close(false);
+  std::array<uint8_t, 4> buffer;
+  CHECK(accepted->Receive(buffer, false, kWait, error) == 0);
+  CHECK(pair.a->peers().empty());
+}
+
+TEST_CASE("System Link stream ports are their own", "[net][system_link][tcp]") {
+  Pair pair;
+  auto first = Stream(*pair.a);
+  REQUIRE(first->Bind(1003) == 0);
+  CHECK(first->Bind(1004) == kWsaInvalid);
+  auto second = Stream(*pair.a);
+  CHECK(second->Bind(1003) == kWsaAddressInUse);
+  // UDP and VDP ports are apart from TCP ones.
+  CHECK(Bind(*pair.a, 1003, false));
+  auto dynamic = Stream(*pair.a);
+  REQUIRE(dynamic->Bind(0) == 0);
+  CHECK(dynamic->port() >= 49152);
+  CHECK(second->Listen(1) == kWsaInvalid);
+  first->Close(false);
+  CHECK(second->Bind(1003) == 0);
+}
+
+TEST_CASE("System Link streams wake calls when closed or the LAN goes away",
+          "[net][system_link][tcp]") {
+  for (bool lan : {false, true}) {
+    Pair pair;
+    auto listener = Listen(*pair.b, 1003);
+    uint32_t host;
+    REQUIRE(pair.a->Map(pair.b->identity(), pair.id, host) == 0);
+    auto client = Stream(*pair.a);
+    REQUIRE(client->Connect({host, 1003}, kWait) == 0);
+    uint32_t error = 0;
+    auto blocked = std::async(std::launch::async, [&] {
+      uint8_t byte;
+      return client->Receive(std::span(&byte, 1), false,
+                             SystemLinkStream::kWaitForever, error);
+    });
+    Endpoint source;
+    uint32_t accept_error = 0;
+    // Kept open, as closing it would end the client's receive.
+    auto accepted = listener->Accept(source, kWait, accept_error);
+    REQUIRE(accepted);
+    auto accepting = std::async(std::launch::async, [&] {
+      return listener->Accept(source, SystemLinkStream::kWaitForever,
+                              accept_error);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (lan) {
+      pair.transports[0]->Disconnect();
+      pair.transports[1]->Disconnect();
+    } else {
+      client->Close(false);
+      listener->Close(false);
+    }
+    REQUIRE(blocked.wait_for(std::chrono::seconds(5)) ==
+            std::future_status::ready);
+    CHECK(blocked.get() == -1);
+    CHECK(error == (lan ? kWsaNetworkDown : kWsaInterrupted));
+    REQUIRE(accepting.wait_for(std::chrono::seconds(5)) ==
+            std::future_status::ready);
+    CHECK_FALSE(accepting.get());
+    CHECK(accept_error == (lan ? kWsaNetworkDown : kWsaInterrupted));
+  }
+}
+
+TEST_CASE("System Link streams end when the peer goes away",
+          "[net][system_link][tcp]") {
+  Pair pair;
+  auto listener = Listen(*pair.b, 1003);
+  uint32_t host;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, host) == 0);
+  auto client = Stream(*pair.a);
+  REQUIRE(client->Connect({host, 1003}, kWait) == 0);
+  Endpoint source;
+  uint32_t error = 0;
+  auto accepted = listener->Accept(source, kWait, error);
+  REQUIRE(accepted);
+  std::atomic<uint32_t> events{0};
+  accepted->SetReadyCallback([&](uint32_t happened) { events |= happened; });
+  REQUIRE(pair.b->UnregisterKey(pair.id) == 0);
+  CHECK(events.load() & kStreamClose);
+  std::array<uint8_t, 4> buffer;
+  CHECK(accepted->Receive(buffer, false, 0, error) == -1);
+  CHECK(error == kWsaConnectionReset);
+  CHECK(accepted->Send(buffer, 0, error) == -1);
+  CHECK(error == kWsaConnectionReset);
+}
+
+// A connected stream on each side, the client on a and the host on b.
+struct StreamPair {
+  Pair pair;
+  std::unique_ptr<SystemLinkStream> listener, client, accepted;
+  uint32_t host = 0;
+  Endpoint source;
+
+  explicit StreamPair(uint16_t port = 0) {
+    listener = Listen(*pair.b, 1003);
+    REQUIRE(pair.a->Map(pair.b->identity(), pair.id, host) == 0);
+    client = Stream(*pair.a);
+    if (port) {
+      REQUIRE(client->Bind(port) == 0);
+    }
+    REQUIRE(client->Connect({host, 1003}, kWait) == 0);
+    uint32_t error = 0;
+    accepted = listener->Accept(source, kWait, error);
+    REQUIRE(accepted);
+  }
+};
+
+TEST_CASE("System Link datagrams still leave while a stream bursts",
+          "[net][system_link][tcp]") {
+  StreamPair streams;
+  auto& pair = streams.pair;
+  // Warm up until a burst fills the peer's whole window.
+  const auto warmup = Pattern(300000, 1);
+  auto sending = std::async(std::launch::async,
+                            [&] { return SendAll(*streams.client, warmup); });
+  CHECK(ReceiveAll(*streams.accepted, warmup.size()) == warmup);
+  CHECK(sending.get());
+  auto tx = Bind(*pair.a, 1001, false);
+  REQUIRE(tx);
+  const std::array<uint8_t, 4> datagram{1, 2, 3, 4};
+  uint32_t error = 0;
+  // Lets the last acknowledgments open the whole window.
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  // The worker sends nothing more for now.
+  pair.transports[0]->Hold();
+  CHECK(tx->Send({streams.host, 1001}, datagram, error) == 4);
+  CHECK(WaitFor([&] { return pair.transports[0]->held() > 0; }));
+  const auto burst = Pattern(tcp::kBufferSize, 2);
+  CHECK(streams.client->Send(burst, 0, error) > 0);
+  int failed = 0;
+  for (int i = 0; i < 20; ++i) {
+    failed += tx->Send({streams.host, 1001}, datagram, error) < 0;
+  }
+  CHECK(failed == 0);
+  pair.transports[0]->Release();
+}
+
+TEST_CASE("System Link streams reconnect from the port of a closed one",
+          "[net][system_link][tcp]") {
+  StreamPair streams(1500);
+  // The host keeps its end open after the client is done.
+  streams.client->Close(false);
+  std::array<uint8_t, 4> buffer;
+  uint32_t error = 0;
+  REQUIRE(streams.accepted->Receive(buffer, false, kWait, error) == 0);
+  auto again = Stream(*streams.pair.a);
+  REQUIRE(again->Bind(1500) == 0);
+  CHECK(again->Connect({streams.host, 1003}, 3000) == 0);
+  Endpoint source;
+  auto second = streams.listener->Accept(source, 3000, error);
+  REQUIRE(second);
+  CHECK(source.port == 1500);
+}
+
+TEST_CASE("System Link streams keep data when their ports are taken again",
+          "[net][system_link][tcp]") {
+  StreamPair streams(1500);
+  // The host finishes first and waits out TIME_WAIT with data unread.
+  REQUIRE(streams.accepted->Shutdown(1) == 0);
+  std::array<uint8_t, 8> buffer;
+  uint32_t error = 0;
+  REQUIRE(streams.client->Receive(buffer, false, kWait, error) == 0);
+  const auto data = Pattern(5, 4);
+  REQUIRE(SendAll(*streams.client, data));
+  streams.client->Close(false);
+  REQUIRE(WaitFor([&] { return streams.accepted->PendingBytes() == 5; }));
+  auto again = Stream(*streams.pair.a);
+  REQUIRE(again->Bind(1500) == 0);
+  REQUIRE(again->Connect({streams.host, 1003}, kWait) == 0);
+  CHECK(ReceiveAll(*streams.accepted, data.size()) == data);
+}
+
+TEST_CASE("System Link streams report a finished connect when armed",
+          "[net][system_link][tcp]") {
+  StreamPair streams;
+  uint32_t events = 0;
+  streams.client->SetReadyCallback([&](uint32_t ready) { events |= ready; });
+  CHECK(events == (kStreamConnect | kStreamWrite));
+  // Only once.
+  events = 0;
+  streams.client->SetReadyCallback([&](uint32_t ready) { events |= ready; });
+  CHECK(events == kStreamWrite);
+  streams.client->SetReadyCallback(nullptr);
+}
+
+TEST_CASE("System Link connects end when their peer is dropped",
+          "[net][system_link][tcp]") {
+  for (bool unregister : {false, true}) {
+    Pair pair;
+    // Nobody answers for this address so the connect stays under way.
+    auto absent = pair.b->identity();
+    absent[kEnetOffset + 5] ^= 0x40;
+    uint32_t address;
+    REQUIRE(pair.a->Map(absent, pair.id, address) == 0);
+    auto client = Stream(*pair.a);
+    REQUIRE(client->Connect({address, 1003}, 0) == kWsaWouldBlock);
+    REQUIRE(client->Connect({address, 1003}, 0) == kWsaAlready);
+    if (unregister) {
+      REQUIRE(pair.a->UnregisterKey(pair.id) == 0);
+    } else {
+      REQUIRE(pair.a->Unmap(address) == 0);
+    }
+    CHECK(client->Connect({address, 1003}, 0) == kWsaHostUnreachable);
+    CHECK(client->Failed());
+  }
+}
+
+TEST_CASE("System Link streams keep what arrived before the peer left",
+          "[net][system_link][tcp]") {
+  StreamPair streams;
+  std::atomic<uint32_t> events{0};
+  streams.client->SetReadyCallback(
+      [&](uint32_t happened) { events |= happened; });
+  const auto data = Pattern(100, 5);
+  REQUIRE(SendAll(*streams.accepted, data));
+  streams.accepted->Close(false);
+  REQUIRE(WaitFor([&] { return events.load() & kStreamClose; }));
+  REQUIRE(streams.pair.b->Unmap(streams.source.address) == 0);
+  // The association is gone before the client read anything.
+  REQUIRE(WaitFor([&] { return streams.pair.a->peers().empty(); }));
+  CHECK(ReceiveAll(*streams.client, data.size()) == data);
+  std::array<uint8_t, 4> buffer;
+  uint32_t error = 0;
+  CHECK(streams.client->Receive(buffer, false, 0, error) == 0);
+}
+
+TEST_CASE("System Link stream shutdowns wake blocked calls",
+          "[net][system_link][tcp]") {
+  StreamPair streams;
+  uint32_t error = 0;
+  auto blocked = std::async(std::launch::async, [&] {
+    uint8_t byte;
+    return streams.client->Receive(std::span(&byte, 1), false,
+                                   SystemLinkStream::kWaitForever, error);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  REQUIRE(streams.client->Shutdown(0) == 0);
+  const bool woke =
+      blocked.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  CHECK(woke);
+  // Ends the receive either way.
+  streams.client->Close(false);
+  CHECK(blocked.get() == -1);
+  if (woke) {
+    CHECK(error == kWsaShutdown);
+  }
+}
+
+TEST_CASE("System Link streams reset data sent to a closed socket",
+          "[net][system_link][tcp]") {
+  StreamPair streams;
+  streams.client->Close(false);
+  std::array<uint8_t, 16> buffer;
+  uint32_t error = 0;
+  REQUIRE(streams.accepted->Receive(buffer, false, kWait, error) == 0);
+  // Nobody reads on the client side any more.
+  REQUIRE(
+      WaitFor([&] { return streams.accepted->Send(buffer, 0, error) < 0; }));
+  CHECK(error == kWsaConnectionReset);
 }
 
 }  // namespace xe::net::secure::test

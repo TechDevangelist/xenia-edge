@@ -128,6 +128,16 @@ std::vector<uint8_t> Ports(uint16_t source, uint16_t destination,
 
 bool ValidSpi(uint32_t spi) { return spi && spi <= 0xFFFFFF; }
 
+// Sequence, acknowledgment, offset, flags and window.
+constexpr size_t kTcpHeaderSize = 12;
+
+// The header length must cover the fixed fields and its options come out of
+// the encrypted part.
+bool ValidTcpOffset(uint8_t offset, size_t encrypted_size) {
+  const size_t words = offset >> 4;
+  return words >= 5 && (words - 5) * 4 <= encrypted_size;
+}
+
 constexpr uint16_t kQosProbeType = 0x0658;
 constexpr uint16_t kQosReplyType = 0x0758;
 constexpr size_t kQosProbeSize = 78;
@@ -260,10 +270,19 @@ bool Encode(const ProtectionKeys& keys, uint32_t spi, uint32_t sequence,
     return false;
   }
   uint8_t encoding = 0;
-  auto ports =
+  auto header =
       packet.kind == Kind::Control
           ? std::vector<uint8_t>{}
           : Ports(packet.source_port, packet.destination_port, encoding);
+  if (packet.kind == Kind::Tcp) {
+    header.resize(header.size() + kTcpHeaderSize);
+    auto fields = std::span(header).last(kTcpHeaderSize);
+    Write(fields.first(4), packet.tcp.sequence);
+    Write(fields.subspan(4, 4), packet.tcp.acknowledgment);
+    fields[8] = packet.tcp.offset;
+    fields[9] = packet.tcp.flags;
+    Write(fields.last(2), packet.tcp.window);
+  }
   std::vector<uint8_t> plain = packet.encrypted;
   uint8_t kind;
   if (packet.kind == Kind::Control) {
@@ -282,6 +301,12 @@ bool Encode(const ProtectionKeys& keys, uint32_t spi, uint32_t sequence,
       return false;
     }
     kind = 7 + encoding;
+  } else if (packet.kind == Kind::Tcp) {
+    if (!packet.clear.empty() ||
+        !ValidTcpOffset(packet.tcp.offset, plain.size())) {
+      return false;
+    }
+    kind = 1 + encoding;
   } else if (packet.kind == Kind::Udp) {
     if (!packet.clear.empty()) {
       return false;
@@ -291,11 +316,11 @@ bool Encode(const ProtectionKeys& keys, uint32_t spi, uint32_t sequence,
     kind = (plain.empty() ? 10 : packet.clear.empty() ? 13 : 7) + encoding;
   }
   const uint8_t reserved = uint8_t((8 - plain.size() % 8) % 8);
-  // Port bytes fill the cipher padding first and any remainder goes in the
-  // clear tail.
-  const size_t embedded = std::min<size_t>(reserved, ports.size());
+  // Header bytes, the ports and then the rest of a TCP header, fill the cipher
+  // padding first and any remainder goes in the clear tail.
+  const size_t embedded = std::min<size_t>(reserved, header.size());
   plain.resize(plain.size() + reserved - embedded, 0);
-  plain.insert(plain.end(), ports.begin(), ports.begin() + embedded);
+  plain.insert(plain.end(), header.begin(), header.begin() + embedded);
   const bool count = kind >= 7 && kind <= 9;
   if (count && plain.size() > 2040) {
     return false;
@@ -307,7 +332,7 @@ bool Encode(const ProtectionKeys& keys, uint32_t spi, uint32_t sequence,
       discovery ? sequence | (sequence << 16) : sequence;
   auto ciphertext = Cbc(keys.cipher, PacketIv(keys.iv_seed, full_sequence),
                         plain, true, discovery);
-  std::vector<uint8_t> tail(ports.begin() + embedded, ports.end());
+  std::vector<uint8_t> tail(header.begin() + embedded, header.end());
   tail.insert(tail.end(), packet.clear.begin(), packet.clear.end());
   if (discovery) {
     tail.insert(tail.end(), packet.metadata.begin(), packet.metadata.end());
@@ -339,7 +364,7 @@ std::optional<Packet> Decode(const ProtectionKeys& keys, uint32_t spi,
     return std::nullopt;
   }
   const uint8_t kind = wire[0] & 15;
-  if ((kind >= 1 && kind <= 3) || (discovery && (kind < 7 || kind > 9))) {
+  if (discovery && (kind < 7 || kind > 9)) {
     return std::nullopt;
   }
   const size_t reserved = (wire[0] >> 5) | ((wire[0] & 0x10) >> 1);
@@ -347,14 +372,15 @@ std::optional<Packet> Decode(const ProtectionKeys& keys, uint32_t spi,
   if (reserved > 7) {
     return std::nullopt;
   }
-  const uint8_t encoding = kind ? (kind - 4) % 3 : 0;
-  const size_t port_size = 2 * encoding;
-  const size_t embedded = std::min(reserved, port_size);
-  const size_t clear_ports = port_size - embedded;
+  const uint8_t encoding = kind ? (kind - 1) % 3 : 0;
+  const bool tcp = kind >= 1 && kind <= 3;
+  const size_t header_size = 2 * encoding + (tcp ? kTcpHeaderSize : 0);
+  const size_t embedded = std::min(reserved, header_size);
+  const size_t clear_header = header_size - embedded;
   const bool count = kind >= 7 && kind <= 9;
   size_t ciphertext_size;
   if (count) {
-    if (wire.size() < 17 + clear_ports + (discovery ? 12 : 0)) {
+    if (wire.size() < 17 + clear_header + (discovery ? 12 : 0)) {
       return std::nullopt;
     }
     ciphertext_size = size_t(wire[wire.size() - 13]) * 8;
@@ -364,10 +390,10 @@ std::optional<Packet> Decode(const ProtectionKeys& keys, uint32_t spi,
     }
     ciphertext_size = 0;
   } else {
-    if (wire.size() < 16 + clear_ports) {
+    if (wire.size() < 16 + clear_header) {
       return std::nullopt;
     }
-    ciphertext_size = (wire.size() - 16 - clear_ports) & ~size_t(7);
+    ciphertext_size = (wire.size() - 16 - clear_header) & ~size_t(7);
   }
   if (ciphertext_size < reserved || ciphertext_size > wire.size() - 16) {
     return std::nullopt;
@@ -375,7 +401,7 @@ std::optional<Packet> Decode(const ProtectionKeys& keys, uint32_t spi,
   const auto ciphertext = wire.subspan(4, ciphertext_size);
   auto tail =
       wire.subspan(4 + ciphertext_size, wire.size() - 16 - ciphertext_size);
-  if (tail.size() < clear_ports + (count ? 1 : 0) + (discovery ? 12 : 0)) {
+  if (tail.size() < clear_header + (count ? 1 : 0) + (discovery ? 12 : 0)) {
     return std::nullopt;
   }
   const uint32_t full_sequence =
@@ -396,19 +422,31 @@ std::optional<Packet> Decode(const ProtectionKeys& keys, uint32_t spi,
   Packet packet;
   packet.kind = discovery   ? Kind::Discovery
                 : kind == 0 ? Kind::Control
+                : tcp       ? Kind::Tcp
                 : kind <= 6 ? Kind::Udp
                             : Kind::Vdp;
-  std::vector<uint8_t> ports(plain.end() - embedded, plain.end());
-  ports.insert(ports.end(), tail.begin(), tail.begin() + clear_ports);
+  std::vector<uint8_t> header(plain.end() - embedded, plain.end());
+  header.insert(header.end(), tail.begin(), tail.begin() + clear_header);
   if (encoding == 1) {
-    packet.source_port = 1000 + ports[0];
-    packet.destination_port = 1000 + ports[1];
+    packet.source_port = 1000 + header[0];
+    packet.destination_port = 1000 + header[1];
   } else if (encoding == 2) {
-    packet.source_port = uint16_t(Read(std::span(ports).first(2)));
-    packet.destination_port = uint16_t(Read(std::span(ports).last(2)));
+    packet.source_port = uint16_t(Read(std::span(header).first(2)));
+    packet.destination_port = uint16_t(Read(std::span(header).subspan(2, 2)));
+  }
+  if (tcp) {
+    auto fields = std::span(header).last(kTcpHeaderSize);
+    packet.tcp.sequence = uint32_t(Read(fields.first(4)));
+    packet.tcp.acknowledgment = uint32_t(Read(fields.subspan(4, 4)));
+    packet.tcp.offset = fields[8];
+    packet.tcp.flags = fields[9];
+    packet.tcp.window = uint16_t(Read(fields.last(2)));
+    if (!ValidTcpOffset(packet.tcp.offset, body_size)) {
+      return std::nullopt;
+    }
   }
   packet.encrypted.assign(plain.begin(), plain.begin() + body_size);
-  tail = tail.subspan(clear_ports);
+  tail = tail.subspan(clear_header);
   if (count) {
     tail = tail.first(tail.size() - 1);
   }

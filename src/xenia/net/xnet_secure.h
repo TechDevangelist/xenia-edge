@@ -102,12 +102,25 @@ struct Frame {
 std::optional<std::vector<uint8_t>> EncodeFrame(const Frame& frame);
 std::optional<Frame> DecodeFrame(std::span<const uint8_t> wire);
 
-enum class Kind { Control, Udp, Vdp, Discovery };
+enum class Kind { Control, Tcp, Udp, Vdp, Discovery };
+
+// The part of a TCP header that follows the ports. There is no checksum or
+// urgent pointer.
+struct TcpHeader {
+  uint32_t sequence = 0, acknowledgment = 0;
+  // Header length in 32-bit words, options included, in the high nibble.
+  uint8_t offset = 0x50;
+  uint8_t flags = 0;
+  uint16_t window = 0;
+  bool operator==(const TcpHeader&) const = default;
+};
 
 struct Packet {
   Kind kind = Kind::Udp;
   uint16_t source_port = 1000, destination_port = 1000;
   uint16_t control_type = 0;
+  // TCP options lead |encrypted|, the segment's data follows them.
+  TcpHeader tcp;
   std::vector<uint8_t> encrypted, clear;
   Metadata metadata{};
 };

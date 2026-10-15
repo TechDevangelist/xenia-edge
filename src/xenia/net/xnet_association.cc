@@ -20,6 +20,10 @@
 namespace xe::net::secure {
 namespace {
 
+// Frames waiting for the owner to send them. A TCP segment stops short of the
+// limit so a window's worth of them leaves room for everything else.
+constexpr size_t kOutboundLimit = 512, kTcpOutboundLimit = 384;
+
 Mac Machine(const Address& address) {
   Mac mac;
   std::copy_n(address.begin() + 10, mac.size(), mac.begin());
@@ -105,7 +109,7 @@ uint64_t Associations::NewFreshness() {
 
 bool Associations::Emit(Mac destination, std::vector<uint8_t> payload,
                         bool broadcast) {
-  if (outbound_.size() >= 64 || payload.size() + 28 > config_.mtu) {
+  if (outbound_.size() >= kOutboundLimit || payload.size() + 28 > config_.mtu) {
     return false;
   }
   outbound_.push_back({local_, destination, broadcast, std::move(payload)});
@@ -188,6 +192,7 @@ bool Associations::Protected(State& state, const Packet& packet, uint64_t now) {
 bool Associations::Send(const Address& peer, const KeyId& id, Packet packet,
                         uint64_t now) {
   if (packet.kind == Kind::Control || packet.kind == Kind::Discovery ||
+      (packet.kind == Kind::Tcp && outbound_.size() >= kTcpOutboundLimit) ||
       packet.encrypted.size() + packet.clear.size() > config_.mtu ||
       !Connect(peer, id, now)) {
     return false;
