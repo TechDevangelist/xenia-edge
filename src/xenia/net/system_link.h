@@ -41,6 +41,9 @@ inline constexpr uint32_t kWsaTimedOut = 10060;
 inline constexpr uint32_t kWsaConnectionRefused = 10061;
 inline constexpr uint32_t kWsaHostUnreachable = 10065;
 
+// What XNetGetConnectStatus reports for an address without a peer.
+inline constexpr uint32_t kConnectStatusLost = 3;
+
 // FD_* event bits.
 inline constexpr uint32_t kStreamRead = 0x01;
 inline constexpr uint32_t kStreamWrite = 0x02;

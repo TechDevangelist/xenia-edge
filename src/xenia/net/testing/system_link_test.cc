@@ -334,7 +334,7 @@ TEST_CASE("System Link ports deliver broadcasts and secure datagrams",
     REQUIRE(sender.Unmap(address) == 0);
     CHECK(tx->PendingBytes() == 0);
     CHECK_FALSE(tx->Readable());
-    CHECK(sender.ConnectStatus(address) == 0);
+    CHECK(sender.ConnectStatus(address) == 3);
     tx->Close();
     rx->Close();
   }
@@ -653,6 +653,22 @@ TEST_CASE("System Link unmaps a peer that never connected",
   CHECK(pair.a->Unmap(address) == kWsaInvalid);
 }
 
+TEST_CASE("System Link reports addresses it has not mapped as lost",
+          "[net][system_link]") {
+  Pair pair;
+  // 4D5307EA polls the broadcast address and waits while it reads idle.
+  CHECK(pair.a->ConnectStatus(0xFFFFFFFF) == 3);
+  CHECK(pair.a->ConnectStatus(0) == 3);
+  uint32_t self;
+  REQUIRE(pair.a->Map(pair.a->identity(), pair.id, self) == 0);
+  CHECK(pair.a->ConnectStatus(self) == 3);
+  uint32_t address;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, address) == 0);
+  CHECK(pair.a->ConnectStatus(address) == 0);
+  REQUIRE(pair.a->Unmap(address) == 0);
+  CHECK(pair.a->ConnectStatus(address) == 3);
+}
+
 TEST_CASE("System Link keeps a peer through a simultaneous connect",
           "[net][system_link]") {
   Pair pair;
@@ -787,7 +803,11 @@ TEST_CASE(
   CHECK(woken.get_future().wait_for(std::chrono::seconds(5)) ==
         std::future_status::ready);
   CHECK(pair.a->peers().empty());
-  CHECK(pair.a->ConnectStatus(address) == 0);
+  CHECK(pair.a->ConnectStatus(address) == 3);
+  // A peer mapped once the LAN is down has no status either.
+  uint32_t again;
+  REQUIRE(pair.a->Map(pair.b->identity(), pair.id, again) == 0);
+  CHECK(pair.a->ConnectStatus(again) == 3);
   CHECK(tx->Send({address, 1001}, data, error) == -1);
   CHECK(error == kWsaNetworkDown);
   CHECK_FALSE(pair.a->Bind(1002, false, error));

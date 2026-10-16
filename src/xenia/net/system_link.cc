@@ -1592,8 +1592,10 @@ uint32_t SystemLink::Connect(uint32_t secure) {
 uint32_t SystemLink::ConnectStatus(uint32_t secure) const {
   std::lock_guard lock(state_->mutex);
   auto found = state_->peers.find(secure);
+  // Only a mapped peer on a live LAN has a status. Every other address reads
+  // as lost, loopback and the broadcast address included.
   if (found == state_->peers.end() || !state_->transport->healthy()) {
-    return 0;
+    return kConnectStatusLost;
   }
   return static_cast<uint32_t>(
       state_->associations.Status(found->second.address, found->second.key_id));

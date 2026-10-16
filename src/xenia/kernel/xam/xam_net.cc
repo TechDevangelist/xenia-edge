@@ -1759,7 +1759,7 @@ DECLARE_XAM_EXPORT1(NetDll_XNetConnect, kNetworking, kImplemented);
 dword_result_t NetDll_XNetGetConnectStatus_entry(dword_t caller,
                                                  dword_t in_addr) {
   auto link = GetSystemLink(kernel_state());
-  return link ? link->ConnectStatus(in_addr) : 0;
+  return link ? link->ConnectStatus(in_addr) : net::kConnectStatusLost;
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetGetConnectStatus, kNetworking, kImplemented);
 
