@@ -185,12 +185,37 @@ uint32_t XTitleEnumerator::WriteItems(uint8_t* buffer_data,
 uint32_t XUserStatsEnumerator::WriteItems(uint8_t* buffer_data,
                                           uint32_t buffer_size,
                                           uint32_t* written_count) {
-  size_t count = std::min(items_.size() - current_item_, items_per_enumerate());
-  if (!count) {
+  if (written_) {
     return X_ERROR_NO_MORE_FILES;
   }
 
-  size_t size = count * item_size();
+  if (buffer_size < buffer_size_) {
+    return X_ERROR_INSUFFICIENT_BUFFER;
+  }
+
+  // There is no stats server so every view reads back with no rows. 4D5307EA
+  // walks the views and copies a view's first row and that row's columns
+  // without checking the result or num_rows. Zeroing the buffer keeps those
+  // empty.
+  std::memset(buffer_data, 0, buffer_size);
+  auto results = reinterpret_cast<XUSER_STATS_READ_RESULTS*>(buffer_data);
+  results->num_views = static_cast<uint32_t>(view_ids_.size());
+  results->views_ptr = memory()->HostToGuestVirtual(buffer_data) +
+                       sizeof(XUSER_STATS_READ_RESULTS);
+  // 584111FA and 5841089F dereference rows_ptr even with no rows.
+  const uint32_t rows_ptr =
+      results->views_ptr +
+      static_cast<uint32_t>(view_ids_.size() * sizeof(XUSER_STATS_VIEW));
+  auto views = reinterpret_cast<XUSER_STATS_VIEW*>(results + 1);
+  for (size_t i = 0; i < view_ids_.size(); ++i) {
+    views[i].view_id = view_ids_[i];
+    views[i].rows_ptr = rows_ptr;
+  }
+  written_ = true;
+
+  if (written_count) {
+    *written_count = 1;
+  }
 
   return X_ERROR_SUCCESS;
 }

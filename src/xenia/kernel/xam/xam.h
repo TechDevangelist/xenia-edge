@@ -369,15 +369,6 @@ struct XMP_USER_PLAYLIST_INFO {
 };
 static_assert_size(XMP_USER_PLAYLIST_INFO, 0x334);
 
-constexpr uint8_t kStatsMaxAmount = 64;
-
-struct X_STATS_DETAILS {
-  xe::be<uint32_t> id;
-  xe::be<uint32_t> stats_amount;
-  xe::be<uint16_t> stats[kStatsMaxAmount];
-};
-static_assert_size(X_STATS_DETAILS, 8 + kStatsMaxAmount * 2);
-
 enum LoaderLaunchFlags : uint32_t {
   GetSystemVersion = 0x00000040,  // XamUpdateGetCurrentSystemVersion
   GetVersionFromExecutionId = 0x00010000,

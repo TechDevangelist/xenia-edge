@@ -1167,36 +1167,35 @@ dword_result_t XamUserIsParentalControlled_entry(dword_t user_index) {
 DECLARE_XAM_EXPORT1(XamUserIsParentalControlled, kUserProfiles, kImplemented);
 
 dword_result_t XamUserCreateStatsEnumerator_entry(
-    dword_t title_id, dword_t user_index, dword_t count, dword_t flags,
-    dword_t size, pointer_t<X_STATS_DETAILS> stats_ptr,
+    dword_t title_id, dword_t type, qword_t pivot, dword_t num_rows,
+    dword_t num_specs,
+    pointer_t<XUserStatsEnumerator::XUSER_STATS_SPEC> specs_ptr,
     lpdword_t buffer_size_ptr, lpdword_t handle_ptr) {
-  if (!count || !buffer_size_ptr || !handle_ptr || !stats_ptr) {
+  if (!num_specs || !specs_ptr || !num_rows || num_rows > 100 ||
+      !buffer_size_ptr || !handle_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index >= XUserMaxUserCount) {
-    return X_ERROR_INVALID_PARAMETER;
+  // The buffer has room for every requested row: 0x30 bytes per row and 0x1C
+  // per column.
+  const XUserStatsEnumerator::XUSER_STATS_SPEC* specs = specs_ptr;
+  std::vector<uint32_t> view_ids;
+  uint32_t buffer_size = sizeof(XUserStatsEnumerator::XUSER_STATS_READ_RESULTS);
+  for (uint32_t i = 0; i < num_specs; ++i) {
+    view_ids.push_back(specs[i].ViewId);
+    buffer_size += sizeof(XUserStatsEnumerator::XUSER_STATS_VIEW) +
+                   num_rows * (0x30 + specs[i].NumColumnIds * 0x1C);
   }
 
-  if (!flags || flags > 0x64) {
-    return X_ERROR_INVALID_PARAMETER;
-  }
-
-  if (!size) {
-    return X_ERROR_INVALID_PARAMETER;
-  }
-
-  if (buffer_size_ptr) {
-    *buffer_size_ptr = 0;  // sizeof(X_STATS_DETAILS) * stats_ptr->stats_amount;
-  }
-
-  auto e = object_ref<XUserStatsEnumerator>(
-      new XUserStatsEnumerator(kernel_state(), 0));
-  const X_STATUS result = e->Initialize(user_index, 0xFB, 0xB0023, 0xB0024, 0);
+  auto e = object_ref<XUserStatsEnumerator>(new XUserStatsEnumerator(
+      kernel_state(), num_rows, std::move(view_ids), buffer_size));
+  const X_STATUS result =
+      e->Initialize(XUserIndexNone, 0xFB, 0xB0023, 0xB0024, 0);
   if (XFAILED(result)) {
     return result;
   }
 
+  *buffer_size_ptr = buffer_size;
   *handle_ptr = e->handle();
   return X_ERROR_SUCCESS;
 }

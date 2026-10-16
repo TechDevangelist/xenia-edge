@@ -211,16 +211,36 @@ class XUserStatsEnumerator : public XEnumerator {
     xe::be<uint32_t> NumColumnIds;
     xe::be<uint16_t> rgwColumnIds[0x40];
   };
+  static_assert_size(XUSER_STATS_SPEC, 0x88);
 
-  XUserStatsEnumerator(KernelState* kernel_state, size_t items_per_enumerate)
-      : XEnumerator(kernel_state, items_per_enumerate, 0) {}
+  struct XUSER_STATS_READ_RESULTS {
+    xe::be<uint32_t> num_views;
+    xe::be<uint32_t> views_ptr;
+  };
+  static_assert_size(XUSER_STATS_READ_RESULTS, 0x8);
+
+  struct XUSER_STATS_VIEW {
+    xe::be<uint32_t> view_id;
+    xe::be<uint32_t> total_view_rows;
+    xe::be<uint32_t> num_rows;
+    xe::be<uint32_t> rows_ptr;
+  };
+  static_assert_size(XUSER_STATS_VIEW, 0x10);
+
+  XUserStatsEnumerator(KernelState* kernel_state, size_t items_per_enumerate,
+                       std::vector<uint32_t> view_ids, uint32_t buffer_size)
+      : XEnumerator(kernel_state, items_per_enumerate, 0),
+        view_ids_(std::move(view_ids)),
+        buffer_size_(buffer_size) {}
 
   uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
                       uint32_t* written_count) override;
 
  private:
-  std::vector<XUSER_STATS_SPEC> items_;
-  size_t current_item_ = 0;
+  std::vector<uint32_t> view_ids_;
+  // The size reported to the title, which leaves room for every row.
+  uint32_t buffer_size_;
+  bool written_ = false;
 };
 
 class XMPCreateUserPlaylistEnumerator : public XEnumerator {
