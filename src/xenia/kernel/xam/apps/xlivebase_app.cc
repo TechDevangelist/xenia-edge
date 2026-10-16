@@ -138,10 +138,12 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
       return X_E_SUCCESS;
     }
     case 0x00050009: {
-      // Fixes Xbox Live error for 513107D9
-      XELOGD("XLiveBaseUnk50009({:08X}, {:08X}) unimplemented", buffer_ptr,
+      // XStorageDownloadToMemory. There is no storage server so no file is
+      // ever found. Success would leave the title's buffer unfilled and
+      // 434D083D parses that as its server setup file.
+      XELOGD("XStorageDownloadToMemory({:08X}, {:08X})", buffer_ptr,
              buffer_length);
-      return X_E_SUCCESS;
+      return 0x8015C004;  // X_ONLINE_E_STORAGE_FILE_NOT_FOUND
     }
   }
   XELOGE(
