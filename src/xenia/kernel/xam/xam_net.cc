@@ -454,14 +454,15 @@ dword_result_t NetDll_WSAGetOverlappedResult_entry(
   if (flags_ptr) {
     *flags_ptr = 0;
   }
-  // Closing the socket drops a pending receive.
+  // An overlapped this socket never took still reads as in progress.
   if (overlapped_ptr->internal == X_STATUS_PENDING) {
-    XThread::SetLastError(uint32_t(X_WSAError::X_WSA_OPERATION_ABORTED));
+    XThread::SetLastError(uint32_t(X_WSAError::X_WSA_IO_INCOMPLETE));
     return 0;
   }
-  // internal holds the WSA error of a failed operation.
+  // internal holds the WSA error of a failed operation as 0x8007xxxx.
   if (overlapped_ptr->internal) {
-    XThread::SetLastError(overlapped_ptr->internal);
+    XThread::SetLastError(
+        xboxkrnl::xeRtlNtStatusToDosError(overlapped_ptr->internal));
     return 0;
   }
   return 1;

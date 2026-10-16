@@ -76,12 +76,13 @@ void Scatter(std::span<const uint8_t> data,
   }
 }
 
-// The byte count lands first since a title may poll internal.
-void CompleteOverlapped(XWSAOVERLAPPED* overlapped, uint32_t status,
+// The byte count lands first since a title may poll internal. A failure is
+// stored as its WSA error in 0x8007xxxx form.
+void CompleteOverlapped(XWSAOVERLAPPED* overlapped, uint32_t error,
                         uint32_t bytes) {
   overlapped->internal_high = bytes;
   std::atomic_thread_fence(std::memory_order_release);
-  overlapped->internal = status;
+  overlapped->internal = X_HRESULT_FROM_WIN32(error);
 }
 
 }  // namespace
@@ -151,14 +152,23 @@ struct XSocket::OverlappedReceives {
     }
   }
 
-  // Wakes the waiters without touching guest memory, which may be going away
-  // with the socket.
-  void Close() {
+  // closesocket completes the pending receives as canceled since 4D5307EA
+  // polls internal rather than waiting on the event. Without |cancel| the
+  // waiters are only woken.
+  void Close(bool cancel) {
     std::deque<Receive> dropped;
     {
       std::lock_guard lock(mutex);
       port = nullptr;
       dropped.swap(pending);
+      // Under the lock so a receive never reads as pending once it has left
+      // the queue.
+      if (cancel) {
+        for (auto& receive : dropped) {
+          CompleteOverlapped(receive.overlapped,
+                             uint32_t(X_WSAError::X_WSAECANCELLED), 0);
+        }
+      }
     }
     for (auto& receive : dropped) {
       if (receive.event) {
@@ -313,7 +323,13 @@ XSocket::XSocket(KernelState* kernel_state,
       system_link_stream_(std::move(stream)),
       system_link_address_(system_link_address) {}
 
-XSocket::~XSocket() { Close(); }
+XSocket::~XSocket() {
+  // Guest memory may be going away with a socket the title never closed.
+  if (overlapped_receives_) {
+    overlapped_receives_->Close(false);
+  }
+  Close();
+}
 
 uint64_t XSocket::native_handle() {
   if (tcp_socket_ && tcp_socket_->is_open()) {
@@ -384,7 +400,7 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 
 X_STATUS XSocket::Close() {
   if (overlapped_receives_) {
-    overlapped_receives_->Close();
+    overlapped_receives_->Close(true);
   }
   // Both are kept until destruction since a call on another thread may be in
   // them.
@@ -1181,6 +1197,11 @@ int XSocket::WSARecvFrom(std::vector<std::span<uint8_t>> buffers,
     auto receives = overlapped_receives_;
     {
       std::lock_guard lock(receives->mutex);
+      // A socket being closed takes no new receives.
+      if (!receives->port) {
+        last_error_ = uint32_t(X_WSAError::X_WSAENOTSOCK);
+        return -1;
+      }
       // Ikaruga posts the same overlapped again while it is still pending.
       if (!receives->Pending(overlapped)) {
         if (event) {

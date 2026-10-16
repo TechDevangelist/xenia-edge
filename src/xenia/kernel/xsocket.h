@@ -33,13 +33,13 @@ class XEvent;
 
 enum class X_WSAError : uint32_t {
   X_WSA_INVALID_PARAMETER = 0x0057,
-  X_WSA_OPERATION_ABORTED = 0x03E3,
   X_WSA_IO_INCOMPLETE = 0x03E4,
   X_WSA_IO_PENDING = 0x03E5,
   X_WSAEFAULT = 0x271E,
   X_WSAEINVAL = 0x2726,
   X_WSAENOTSOCK = 0x2736,
   X_WSAEMSGSIZE = 0x2738,
+  X_WSAECANCELLED = 0x2777,
   X_WSAHOST_NOT_FOUND = 0x2AF9,
 };
 
@@ -94,7 +94,7 @@ struct N_XSOCKADDR_IN {
 };
 
 struct XWSAOVERLAPPED {
-  xe::be<uint32_t> internal;       // STATUS_PENDING, then 0 or a WSA error
+  xe::be<uint32_t> internal;       // STATUS_PENDING, then 0 or 0x8007xxxx
   xe::be<uint32_t> internal_high;  // Bytes transferred
   union {
     struct {
