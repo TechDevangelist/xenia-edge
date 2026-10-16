@@ -152,21 +152,18 @@ struct XSocket::OverlappedReceives {
     }
   }
 
-  // closesocket completes the pending receives as canceled since 4D5307EA
-  // polls internal rather than waiting on the event. Without |cancel| the
-  // waiters are only woken.
-  void Close(bool cancel) {
+  // Completes the pending receives with |error| and wakes their waiters. With
+  // |error| 0 the waiters are only woken.
+  void Drop(uint32_t error) {
     std::deque<Receive> dropped;
     {
       std::lock_guard lock(mutex);
-      port = nullptr;
       dropped.swap(pending);
       // Under the lock so a receive never reads as pending once it has left
       // the queue.
-      if (cancel) {
+      if (error) {
         for (auto& receive : dropped) {
-          CompleteOverlapped(receive.overlapped,
-                             uint32_t(X_WSAError::X_WSAECANCELLED), 0);
+          CompleteOverlapped(receive.overlapped, error, 0);
         }
       }
     }
@@ -175,6 +172,16 @@ struct XSocket::OverlappedReceives {
         receive.event->Set(0, false);
       }
     }
+  }
+
+  // closesocket completes the pending receives as canceled since 4D5307EA
+  // polls internal rather than waiting on the event.
+  void Close(bool cancel) {
+    {
+      std::lock_guard lock(mutex);
+      port = nullptr;
+    }
+    Drop(cancel ? uint32_t(X_WSAError::X_WSAECANCELLED) : 0);
   }
 
   std::mutex mutex;
@@ -968,6 +975,17 @@ int XSocket::Shutdown(int how) {
     }
     return 0;
   }
+  if (UsesSystemLink()) {
+    // SD_RECEIVE and SD_BOTH complete the pending receive and fail every later
+    // one. Sends are left alone.
+    if (how != 1) {
+      receive_shutdown_ = true;
+      if (overlapped_receives_) {
+        overlapped_receives_->Drop(net::kWsaShutdown);
+      }
+    }
+    return 0;
+  }
   if (!tcp_socket_ && !udp_socket_) {
     last_error_ = 10057;  // WSAENOTCONN
     return -1;
@@ -1200,6 +1218,10 @@ int XSocket::WSARecvFrom(std::vector<std::span<uint8_t>> buffers,
       // A socket being closed takes no new receives.
       if (!receives->port) {
         last_error_ = uint32_t(X_WSAError::X_WSAENOTSOCK);
+        return -1;
+      }
+      if (receive_shutdown_) {
+        last_error_ = net::kWsaShutdown;
         return -1;
       }
       // Ikaruga posts the same overlapped again while it is still pending.
@@ -1504,6 +1526,9 @@ int XSocket::SystemLinkReceive(uint8_t* buf, uint32_t buf_len, uint32_t flags,
       received =
           system_link_stream_->Receive({buf, buf_len}, peek, wait_ms, error);
       source = system_link_stream_->peer();
+    } else if (receive_shutdown_) {
+      received = -1;
+      error = net::kWsaShutdown;
     } else {
       net::Endpoint datagram;
       received = system_link_port_->Receive({buf, buf_len}, peek, datagram,

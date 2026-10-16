@@ -288,6 +288,8 @@ class XSocket : public XObject {
   std::unique_ptr<net::SystemLinkStream> system_link_stream_;
   // SO_LINGER with a zero timeout so closing resets the connection.
   bool linger_abort_ = false;
+  // Set by shutdown(SD_RECEIVE or SD_BOTH). Receives fail with WSAESHUTDOWN.
+  std::atomic<bool> receive_shutdown_{false};
   // Overlapped receives, shared with the port's ready callback that completes
   // them on the I/O thread.
   struct OverlappedReceives;
