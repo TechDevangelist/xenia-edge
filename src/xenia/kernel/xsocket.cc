@@ -76,11 +76,15 @@ void Scatter(std::span<const uint8_t> data,
   }
 }
 
-// The byte count lands first since a title may poll internal. A failure is
-// stored as its WSA error in 0x8007xxxx form.
+// MSG_PARTIAL, what the flags of a truncated datagram hold.
+constexpr uint32_t kMsgPartial = 0x8000;
+
+// The byte count and flags land first since a title may poll internal. A
+// failure is stored as its WSA error in 0x8007xxxx form.
 void CompleteOverlapped(XWSAOVERLAPPED* overlapped, uint32_t error,
-                        uint32_t bytes) {
+                        uint32_t bytes, uint32_t flags) {
   overlapped->internal_high = bytes;
+  overlapped->offset.low = flags;
   std::atomic_thread_fence(std::memory_order_release);
   overlapped->internal = X_HRESULT_FROM_WIN32(error);
 }
@@ -123,7 +127,8 @@ struct XSocket::OverlappedReceives {
         break;
       }
       // A datagram too large for the buffers still fills them.
-      const bool filled = received >= 0 || error == net::kWsaMessageSize;
+      const bool truncated = received < 0 && error == net::kWsaMessageSize;
+      const bool filled = received >= 0 || truncated;
       const size_t bytes = received >= 0 ? size_t(received) : filled ? size : 0;
       if (filled) {
         Scatter({data.data(), bytes}, receive.buffers);
@@ -139,7 +144,8 @@ struct XSocket::OverlappedReceives {
         }
       }
       CompleteOverlapped(receive.overlapped, received >= 0 ? 0 : error,
-                         static_cast<uint32_t>(bytes));
+                         static_cast<uint32_t>(bytes),
+                         truncated ? kMsgPartial : 0);
       if (receive.event) {
         completed.push_back(std::move(receive.event));
       }
@@ -163,7 +169,7 @@ struct XSocket::OverlappedReceives {
       // the queue.
       if (error) {
         for (auto& receive : dropped) {
-          CompleteOverlapped(receive.overlapped, error, 0);
+          CompleteOverlapped(receive.overlapped, error, 0, 0);
         }
       }
     }
