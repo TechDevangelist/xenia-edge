@@ -1045,6 +1045,13 @@ dword_result_t NetDll_XHttpStartup_entry(dword_t caller, dword_t reserved,
 }
 DECLARE_XAM_EXPORT1(NetDll_XHttpStartup, kNetworking, kStub);
 
+dword_result_t NetDll_XHttpShutdown_entry(dword_t caller) {
+  // NetDll_XHttpStartup creates nothing to release.
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return 1;
+}
+DECLARE_XAM_EXPORT1(NetDll_XHttpShutdown, kNetworking, kStub);
+
 dword_result_t NetDll_XHttpOpen_entry(dword_t caller, lpstring_t user_agent,
                                       dword_t access_type,
                                       lpstring_t proxy_name,
