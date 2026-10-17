@@ -541,7 +541,8 @@ static bool NamesDevice(std::string_view path) {
 // flag 4. The D: drive path is only checked for flag 4.
 static void LaunchTitle(std::string path, std::string_view d_drive_path,
                         uint32_t flags) {
-  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  // Unowned, this frame never unwinds.
+  auto* xam = kernel_state()->GetKernelModule<XamModule>("xam.xex").get();
 
   auto& loader_data = xam->loader_data();
   loader_data.launch_flags = flags;
