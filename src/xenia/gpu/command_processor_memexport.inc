@@ -60,9 +60,9 @@ void MarkMemexportPagesWritten(uint32_t base_bytes, uint32_t size_bytes,
       std::max(memexport_written_page_max_, last_page);
 }
 
-// At a fence or interrupt, after which the guest may read export output or
-// reuse its memory. Awaited output is waited for, as the guest reads it right
-// after. The rest holds the signal back until the returned submission
+// At a fence, interrupt or wait for idle, after which the guest may read export
+// output or reuse its memory. Awaited output is waited for, as the guest reads
+// it right after. The rest holds the signal back until the returned submission
 // completes, or is waited for where CanHoldSignalsForMemexport is false. That
 // submission may still be the one being recorded, which
 // EndSubmissionForHeldSignals ends once anything could be waiting for the

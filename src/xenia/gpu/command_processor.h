@@ -368,9 +368,9 @@ class CommandProcessor {
   // genuinely stuck report.
   virtual uint64_t GetCompletedSubmission() const { return 0; }
 
-  // At a fence or interrupt: the submission whose completion puts the export
-  // output ahead of it in guest RAM, or 0 once it is there, which may take a
-  // wait. See command_processor_memexport.inc.
+  // At a fence, interrupt or wait for idle: the submission whose completion
+  // puts the export output ahead of it in guest RAM, or 0 once it is there,
+  // which may take a wait. See command_processor_memexport.inc.
   virtual uint64_t TakeMemexportSignalSubmission() { return 0; }
   // Ends a submission held-back signals wait for if it is still being
   // recorded.
@@ -396,6 +396,8 @@ class CommandProcessor {
   // Performs held-back signals up to the last one writing physical_address,
   // waiting for the GPU so the command processor can read it.
   void AwaitHeldSignalsWriting(uint32_t physical_address);
+  // Waits for export output and performs all held-back signals.
+  void AwaitHeldSignalsAndMemexport();
 
   virtual void OnPrimaryBufferEnd() {}
 

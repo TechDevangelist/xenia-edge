@@ -675,6 +675,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
                                                value);
         }
         XELOGGPU("GPU wait for idle = {:08X}", value);
+        // Writes after this have to land after the GPU's work before it.
+        COMMAND_PROCESSOR::AwaitHeldSignalsAndMemexport();
         result = true;
         break;
       }

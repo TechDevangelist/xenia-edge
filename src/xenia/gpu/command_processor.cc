@@ -823,6 +823,14 @@ void CommandProcessor::AwaitHeldSignalsWriting(uint32_t physical_address) {
   PerformHeldSignals(await_count);
 }
 
+void CommandProcessor::AwaitHeldSignalsAndMemexport() {
+  uint64_t submission = TakeMemexportSignalSubmission();
+  if (submission) {
+    AwaitSubmissionForHeldSignals(submission);
+  }
+  PerformHeldSignals(held_guest_signals_.size());
+}
+
 void CommandProcessor::PerformHeldSignals(size_t await_count) {
   // A held-back signal is awaited after this long so a lost device that stops
   // anything from completing doesn't leave the guest waiting for it forever.
