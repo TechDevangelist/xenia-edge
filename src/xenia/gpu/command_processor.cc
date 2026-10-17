@@ -10,6 +10,7 @@
 #include "xenia/gpu/command_processor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -120,16 +121,19 @@ DEFINE_bool(
 
 DEFINE_bool(
     memexport_await_pixel_exports, true,
-    "Wait for memory export from pixel shaders to reach guest RAM before a "
-    "fence or coherency request the guest observes. Games read this output on "
-    "the CPU and see stale data without the wait. Needs memexport_enable.",
+    "Wait for memory export from pixel shaders to reach guest RAM at a fence, "
+    "an interrupt or a coherency request for its range. Games read this "
+    "output on the CPU right after. When off, D3D12 and Vulkan hold the fence "
+    "or interrupt back until the output lands instead, if it reaches guest "
+    "RAM in place (see enable_host_buffer). Needs memexport_enable.",
     "GPU");
 
 DEFINE_bool(
     memexport_await_vertex_exports, false,
     "Same as memexport_await_pixel_exports, for vertex shaders. Their output "
-    "usually only feeds later draws, and waiting after each export can stall "
-    "heavily. Needs memexport_enable.",
+    "usually only feeds later draws. Games following each export with a fence "
+    "or coherency request would stall after every one. Needs "
+    "memexport_enable.",
     "GPU");
 
 DEFINE_bool(
@@ -534,6 +538,8 @@ void CommandProcessor::WorkerThreadMain() {
           xe::threading::MaybeYield();
         }
         loop_count++;
+        // The guest may be spinning on a held-back signal.
+        SubmitHeldSignals();
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D ||
@@ -547,6 +553,7 @@ void CommandProcessor::WorkerThreadMain() {
 
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    PerformCompletedHeldSignals();
 
     // ExecutePrimaryBuffer republishes this every read_ptr_update_freq_ dwords
     // as it drains, this is the final position for the burst.
@@ -562,6 +569,8 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   SetTitleStateSuffix({});
+  // The guest they are for is going away.
+  held_guest_signals_.clear();
   ShutdownContext();
 }
 
@@ -740,6 +749,108 @@ void CommandProcessor::LogRegisterSets(uint32_t base_register_index,
     logging::internal::AppendLogLine(LogLevel::Debug, 'd', total_size);
   }
 #endif
+}
+
+void CommandProcessor::WriteGuestFence(uint8_t* destination,
+                                       uint32_t physical_address,
+                                       uint32_t value) {
+  HeldGuestSignal signal;
+  signal.destination = destination;
+  signal.physical_address = physical_address;
+  signal.value = value;
+  HoldOrPerformGuestSignal(signal);
+}
+
+void CommandProcessor::DispatchGuestInterrupt(uint32_t cpu_mask) {
+  HeldGuestSignal signal;
+  signal.value = cpu_mask;
+  HoldOrPerformGuestSignal(signal);
+}
+
+void CommandProcessor::HoldOrPerformGuestSignal(const HeldGuestSignal& signal) {
+  uint64_t submission = TakeMemexportSignalSubmission();
+  PerformCompletedHeldSignals();
+  if (held_guest_signals_.empty() && submission <= GetCompletedSubmission()) {
+    PerformGuestSignal(signal);
+    return;
+  }
+  HeldGuestSignal& held = held_guest_signals_.emplace_back(signal);
+  held.submission = submission;
+  held.held_since = std::chrono::steady_clock::now();
+  held_guest_signals_submission_ =
+      std::max(held_guest_signals_submission_, submission);
+  // A trace records the write right after and has to see it.
+  if (trace_writer_.is_open()) {
+    PerformHeldSignals(held_guest_signals_.size());
+  }
+}
+
+void CommandProcessor::PerformGuestSignal(const HeldGuestSignal& signal) {
+  if (signal.destination) {
+    xe::store(signal.destination, signal.value);
+    return;
+  }
+  for (int n = 0; n < 6; n++) {
+    if (signal.value & (1 << n)) {
+      graphics_system_->DispatchInterruptCallback(1, n);
+    }
+  }
+}
+
+void CommandProcessor::PerformCompletedHeldSignals() {
+  if (!held_guest_signals_.empty()) {
+    PerformHeldSignals(0);
+  }
+}
+
+void CommandProcessor::SubmitHeldSignals() {
+  if (!held_guest_signals_.empty()) {
+    EndSubmissionForHeldSignals(held_guest_signals_submission_);
+    PerformHeldSignals(0);
+  }
+}
+
+void CommandProcessor::AwaitHeldSignalsWriting(uint32_t physical_address) {
+  size_t await_count = held_guest_signals_.size();
+  for (; await_count; --await_count) {
+    const HeldGuestSignal& signal = held_guest_signals_[await_count - 1];
+    // Masked as TranslatePhysical does.
+    if (signal.destination &&
+        !((signal.physical_address ^ physical_address) & 0x1FFFFFFF)) {
+      break;
+    }
+  }
+  PerformHeldSignals(await_count);
+}
+
+void CommandProcessor::PerformHeldSignals(size_t await_count) {
+  // A held-back signal is awaited after this long so a lost device that stops
+  // anything from completing doesn't leave the guest waiting for it forever.
+  constexpr auto kMaxHold = std::chrono::seconds(1);
+  while (!held_guest_signals_.empty()) {
+    const HeldGuestSignal& signal = held_guest_signals_.front();
+    if (signal.submission > GetCompletedSubmission()) {
+      PollCompletedSubmission();
+      if (signal.submission > GetCompletedSubmission()) {
+        if (!await_count &&
+            std::chrono::steady_clock::now() - signal.held_since < kMaxHold) {
+          return;
+        }
+        AwaitSubmissionForHeldSignals(signal.submission);
+        if (signal.submission > GetCompletedSubmission()) {
+          XELOGE(
+              "A guest signal was held back for submission {}, which didn't "
+              "complete",
+              signal.submission);
+        }
+      }
+    }
+    PerformGuestSignal(signal);
+    held_guest_signals_.pop_front();
+    if (await_count) {
+      --await_count;
+    }
+  }
 }
 
 void CommandProcessor::HandleSpecialRegisterWrite(uint32_t index,

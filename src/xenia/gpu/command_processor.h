@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -58,8 +59,9 @@ enum class ZPDMode {
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
 
-// Whether fences and coherency requests wait for memory export from these
-// shader stages.
+// Whether fences, interrupts and coherency requests wait for memory export from
+// these shader stages. Other output holds back fences and interrupts where the
+// backend can hold them.
 bool IsMemexportAwaited(bool used_vertex, bool used_pixel);
 
 // Shared pool capacity for D3D12 and Vulkan.
@@ -210,9 +212,8 @@ class CommandProcessor {
   virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
 
   // Shadowed by backends that route memory export through guest RAM (see
-  // command_processor_memexport.inc). No-ops where export output never reaches
-  // the CPU, so there is nothing to wait for.
-  void AwaitMemexportForFence() {}
+  // command_processor_memexport.inc). A no-op where export output never
+  // reaches the CPU.
   void AwaitMemexportForCoherency(uint32_t base_bytes, uint32_t size_bytes) {}
   // Called before the command processor lets the guest see that the GPU got
   // past earlier commands - a fence, memory write, interrupt or scratch
@@ -366,6 +367,35 @@ class CommandProcessor {
   // Used by strict ZPD to distinguish normal in flight latency from a
   // genuinely stuck report.
   virtual uint64_t GetCompletedSubmission() const { return 0; }
+
+  // At a fence or interrupt: the submission whose completion puts the export
+  // output ahead of it in guest RAM, or 0 once it is there, which may take a
+  // wait. See command_processor_memexport.inc.
+  virtual uint64_t TakeMemexportSignalSubmission() { return 0; }
+  // Ends a submission held-back signals wait for if it is still being
+  // recorded.
+  virtual void EndSubmissionForHeldSignals(uint64_t submission) {}
+  // Waits for a submission held-back signals wait for, ending it first if it is
+  // still being recorded.
+  virtual void AwaitSubmissionForHeldSignals(uint64_t submission) {}
+
+  // Fences and interrupts, which the guest takes as the GPU being past the
+  // commands before them. One is held back until export output ahead of it is
+  // in guest RAM. Later ones wait behind it so the guest sees them in order.
+  // value is in guest byte order. physical_address is where the fence lands,
+  // whichever view destination points through.
+  void WriteGuestFence(uint8_t* destination, uint32_t physical_address,
+                       uint32_t value);
+  void DispatchGuestInterrupt(uint32_t cpu_mask);
+  // Performs held-back signals whose submission has completed, awaiting any
+  // held for too long.
+  void PerformCompletedHeldSignals();
+  // Same, first ending the submission they wait for if it is still being
+  // recorded, for when something may be waiting for one.
+  void SubmitHeldSignals();
+  // Performs held-back signals up to the last one writing physical_address,
+  // waiting for the GPU so the command processor can read it.
+  void AwaitHeldSignalsWriting(uint32_t physical_address);
 
   virtual void OnPrimaryBufferEnd() {}
 
@@ -636,6 +666,26 @@ class CommandProcessor {
   kernel::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* XE_RESTRICT register_file_ = nullptr;
+
+  struct HeldGuestSignal {
+    // Has to complete before this is performed.
+    uint64_t submission = 0;
+    // Null for an interrupt.
+    uint8_t* destination = nullptr;
+    uint32_t physical_address = UINT32_MAX;
+    // In guest byte order, or the CPU mask of an interrupt.
+    uint32_t value = 0;
+    std::chrono::steady_clock::time_point held_since;
+  };
+  std::deque<HeldGuestSignal> held_guest_signals_;
+  // The latest submission a held-back signal waits for.
+  uint64_t held_guest_signals_submission_ = 0;
+  void HoldOrPerformGuestSignal(const HeldGuestSignal& signal);
+  void PerformGuestSignal(const HeldGuestSignal& signal);
+  // Performs the first await_count held-back signals, waiting for the GPU, and
+  // any after them whose submission has completed or that were held for too
+  // long, awaiting those.
+  void PerformHeldSignals(size_t await_count);
 
   ZPDMode zpd_mode_ = ZPDMode::kFast;
 

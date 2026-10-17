@@ -3312,9 +3312,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     if (route_to_host || shared_memory_->is_zero_copy()) {
       // Output lands in guest RAM (host_buffer_, or buffer_ under zero-copy)
       // with no readback needed. Record the written pages for fences and
-      // coherency requests to await. With the host buffer, geometry consumers
-      // also route to it and texture loads copy their range into the device
-      // buffer.
+      // coherency requests. With the host buffer, geometry consumers also route
+      // to it and texture loads copy their range into the device buffer.
       for (const draw_util::MemExportRange& memexport_range :
            memexport_ranges_) {
         MarkMemexportPagesWritten(
@@ -3382,6 +3381,7 @@ void D3D12CommandProcessor::FlushMemexportStagingReadback() {
     return;
   }
   // Staged output is about to reach guest RAM, so no fence need await it.
+  memexport_fence_pending_ = false;
   memexport_await_pending_ = false;
   // Staging copies are recorded in the submission of the export they copy.
   AwaitMemexportSubmission(memexport_last_submission_);

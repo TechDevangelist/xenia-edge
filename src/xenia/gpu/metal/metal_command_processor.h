@@ -940,7 +940,7 @@ class MetalCommandProcessor : public CommandProcessor {
 
   // Memexport tracking for shared memory invalidation.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
-  // Whether fences and coherency requests await memexport_ranges_' output.
+  // Whether coherency requests await memexport_ranges_' output.
   bool memexport_ranges_awaited_ = false;
   // Export output lands in guest RAM through the shared buffer, so nothing is
   // ever staged for readback.
@@ -948,6 +948,14 @@ class MetalCommandProcessor : public CommandProcessor {
   void AwaitMemexportSubmission(uint64_t submission) {
     AwaitAllQueueOperationsCompletion();
   }
+  // Fences wait for export output.
+  // TODO(has207): hold them back as D3D12 and Vulkan do, as waiting stalls at
+  // every fence after a vertex shader export. submission_current_ is the
+  // command buffer being recorded and completions arrive in order. Missing are
+  // EndSubmissionForMemexport ending that command buffer and telling an ended
+  // submission apart from one still being recorded.
+  bool CanHoldSignalsForMemexport() const { return false; }
+  void EndSubmissionForMemexport() {}
   // Page tracking so a fence the guest reads can await export output. The
   // fragment's host/device routing half is unused - Metal has one buffer.
 #include "../command_processor_memexport.inc"

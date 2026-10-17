@@ -425,6 +425,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void AwaitMemexportSubmission(uint64_t submission) {
     CheckSubmissionCompletion(submission);
   }
+  // Without the host buffer or zero-copy, export output reaches guest RAM only
+  // through the staging copy, which a wait makes.
+  bool CanHoldSignalsForMemexport() const {
+    return shared_memory_->GetHostBuffer() != nullptr ||
+           shared_memory_->is_zero_copy();
+  }
+  void EndSubmissionForMemexport() { EndResolveSubmission(); }
   // Export ranges staged but not yet copied out, in record order - a later
   // copy of an overlapping range has to win.
   struct MemexportStagedRange {

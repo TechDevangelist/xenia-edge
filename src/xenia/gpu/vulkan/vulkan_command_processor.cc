@@ -4268,9 +4268,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     if (route_to_host || shared_memory_->is_zero_copy()) {
       // Producer draw: output lands in guest RAM (host_buffer_, or buffer_
       // under zero-copy) with no readback needed. Just record the written pages
-      // for fences and coherency requests to await. With the host buffer,
-      // consumers then route to it (geometry) or copy their own range into the
-      // device buffer on demand (texture loads).
+      // for fences and coherency requests. With the host buffer, consumers then
+      // route to it (geometry) or copy their own range into the device buffer
+      // on demand (texture loads).
       for (const draw_util::MemExportRange& memexport_range :
            memexport_ranges_) {
         MarkMemexportPagesWritten(
@@ -4345,6 +4345,7 @@ void VulkanCommandProcessor::FlushMemexportStagingReadback() {
     return;
   }
   // Staged output is about to reach guest RAM, so no fence need await it.
+  memexport_fence_pending_ = false;
   memexport_await_pending_ = false;
   // Staging copies are recorded in the submission of the export they copy.
   AwaitMemexportSubmission(memexport_last_submission_);

@@ -368,6 +368,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void AwaitMemexportSubmission(uint64_t submission) {
     CheckSubmissionCompletionAndDeviceLoss(submission);
   }
+  // Without the host buffer or zero-copy, export output reaches guest RAM only
+  // through the staging copy, which a wait makes.
+  bool CanHoldSignalsForMemexport() const {
+    return shared_memory_->host_buffer() != VK_NULL_HANDLE ||
+           shared_memory_->is_zero_copy();
+  }
+  void EndSubmissionForMemexport() { EndResolveSubmission(); }
   // Export ranges staged but not yet copied out, in record order - a later
   // copy of an overlapping range has to win.
   struct MemexportStagedRange {

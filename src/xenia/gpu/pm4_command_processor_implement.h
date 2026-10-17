@@ -768,15 +768,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(
   }
 
   // The handler runs as if everything before this point in the command stream
-  // is done, so awaited export output it may read has to be in guest RAM first.
-  COMMAND_PROCESSOR::AwaitMemexportForFence();
+  // is done, export output reaching guest RAM included.
   COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
-
-  for (int n = 0; n < 6; n++) {
-    if (cpu_mask & (1 << n)) {
-      graphics_system_->DispatchInterruptCallback(1, n);
-    }
-  }
+  COMMAND_PROCESSOR::DispatchGuestInterrupt(cpu_mask);
   return true;
 }
 XE_NOINLINE
@@ -877,6 +871,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
                 : register_file_->values[poll_reg_addr];
 
   bool matched = false;
+  // Don't read what a held-back fence is yet to write there.
+  if (is_memory) {
+    COMMAND_PROCESSOR::AwaitHeldSignalsWriting(poll_reg_addr & ~uint32_t(0x3));
+  }
 
   do {
     uint32_t value = value_ref;
@@ -902,6 +900,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     matched = MatchValueAndRef(value & mask, ref, wait_info);
 
     if (!matched) {
+      // The guest may be waiting for a held-back signal before it writes what
+      // this waits for. Checked again before waiting if any was performed.
+      if (!held_guest_signals_.empty()) {
+        size_t held_count = held_guest_signals_.size();
+        COMMAND_PROCESSOR::SubmitHeldSignals();
+        if (held_guest_signals_.size() != held_count) {
+          continue;
+        }
+      }
       // Wait using the duration specified by the guest.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1037,9 +1044,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
 
   uint32_t value;
   if (wait_info & 0x10) {
-    // Memory.
+    // Memory, which a held-back fence may be yet to write.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
+    COMMAND_PROCESSOR::AwaitHeldSignalsWriting(poll_reg_addr);
     trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr), 4);
     value = xe::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
@@ -1110,9 +1118,6 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   // Writeback initiator.
   COMMAND_PROCESSOR::WriteEventInitiator(event_type);
 
-  // The guest treats this fence as "the GPU is done", so awaited export output
-  // it is about to read has to be in guest RAM first.
-  COMMAND_PROCESSOR::AwaitMemexportForFence();
   COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
 
   uint32_t data_value;
@@ -1127,6 +1132,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   uint8_t* write_destination = memory_->TranslatePhysical(address);
+  uint32_t write_physical_address = address;
   if (address > 0x1FFFFFFF) {
     uint32_t writeback_base =
         register_file_->values[XE_GPU_REG_WRITEBACK_START];
@@ -1137,9 +1143,14 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
     if (writeback_base != 0 && writeback_offset < writeback_size) {
       write_destination =
           memory_->TranslateVirtual(0x7F000000 + writeback_offset);
+      // The same memory as this physical address.
+      write_physical_address = writeback_offset;
     }
   }
-  xe::store(write_destination, data_value);
+  // The guest treats this fence as "the GPU is done", export output ahead of it
+  // included.
+  COMMAND_PROCESSOR::WriteGuestFence(write_destination, write_physical_address,
+                                     data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }
@@ -1754,6 +1765,8 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
     // the end of the burst, and then there is nothing honest to publish.
     if (writeback_stride && remaining <= remaining_at_writeback &&
         remaining_at_writeback - remaining >= writeback_stride) {
+      // Held-back signals the GPU is past go out at the same pace.
+      COMMAND_PROCESSOR::PerformCompletedHeldSignals();
       // Re-read the target, the guest can re-point or disable the write-back
       // from its own thread while we are draining.
       uint32_t writeback_ptr = read_ptr_writeback_ptr_;
