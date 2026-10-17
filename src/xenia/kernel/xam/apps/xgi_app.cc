@@ -218,11 +218,24 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       // while offline.
       // 58410889 expects stats session creation failure while offline.
       //
-      // Allow offline session creation, but do not allow Xbox Live featured
-      // session creation.
-
-      if (IsXboxLiveSession(static_cast<SessionFlags>(flags))) {
+      // Presence, stats and matchmaking need the creating user signed in to
+      // Live.
+      constexpr uint32_t kLiveFlags = SessionFlags::PRESENCE |
+                                      SessionFlags::STATS |
+                                      SessionFlags::MATCHMAKING;
+      const UserProfile* user =
+          kernel_state_->xam_state()->GetUserProfile(user_index);
+      const bool live =
+          user && user->signin_state() ==
+                      static_cast<uint32_t>(SignInState::SignedInToLive);
+      if (flags & kLiveFlags && !live) {
         return 0x80155209;  // X_ONLINE_E_SESSION_NOT_LOGGED_ON
+      }
+      // Arbitrated peer networking needs the multiplayer privilege, which only
+      // Live users hold.
+      if (flags & SessionFlags::PEER_NETWORK &&
+          flags & SessionFlags::ARBITRATION && !live) {
+        return 0x80155201;  // X_ONLINE_E_SESSION_INSUFFICIENT_PRIVILEGES
       }
 
       auto session = XSession::FromGuest(kernel_state_, session_ptr);

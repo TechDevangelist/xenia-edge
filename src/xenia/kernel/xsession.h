@@ -52,14 +52,7 @@ enum SessionFlags {
 
   // HELPERS
   SYSTEMLINK_FEATURES = HOST | SYSTEMLINK,
-  LIVE_FEATURES = PRESENCE | STATS | MATCHMAKING | ARBITRATION
 };
-
-inline bool IsOfflineSession(const SessionFlags flags) { return !flags; }
-
-inline bool IsXboxLiveSession(const SessionFlags flags) {
-  return !IsOfflineSession(flags) && flags & SessionFlags::LIVE_FEATURES;
-}
 
 struct XSESSION_INFO {
   net::KeyId session_id;
