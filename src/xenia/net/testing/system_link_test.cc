@@ -751,6 +751,21 @@ TEST_CASE("System Link loops datagrams to its own address back",
   CHECK(pair.a->peers().empty());
 }
 
+TEST_CASE("System Link datagrams refuse destinations sendto rejects",
+          "[net][system_link]") {
+  CHECK(DatagramDestinationError({0, 1000}, true) == kWsaAddressNotAvailable);
+  CHECK(DatagramDestinationError({1, 0}, true) == kWsaAddressNotAvailable);
+  CHECK(DatagramDestinationError({0x7F000002, 1000}, true) ==
+        kWsaAddressNotAvailable);
+  CHECK(DatagramDestinationError({0x7F000001, 1000}, false) == 0);
+  CHECK(DatagramDestinationError({0xFFFFFFFF, 1000}, false) ==
+        kWsaAccessDenied);
+  CHECK(DatagramDestinationError({0xFFFFFFFF, 1000}, true) == 0);
+  // Secure addresses and unmapped ones fail later if at all.
+  CHECK(DatagramDestinationError({1, 1000}, false) == 0);
+  CHECK(DatagramDestinationError({0xA9FE0488, 1000}, false) == 0);
+}
+
 TEST_CASE("System Link unregistering a key retires its peers",
           "[net][system_link]") {
   Pair pair;

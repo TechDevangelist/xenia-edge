@@ -553,9 +553,9 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
     return X_STATUS_UNSUCCESSFUL;
   }
 
-  // SO_BROADCAST
-  if (level == 0xFFFF && optname == 0x0020) {
-    broadcast_socket_ = true;
+  // SO_BROADCAST, a big-endian BOOL.
+  if (level == 0xFFFF && optname == 0x0020 && optlen >= sizeof(uint32_t)) {
+    broadcast_socket_ = xe::load_and_swap<uint32_t>(optval_ptr) != 0;
   }
 
   KeepTimeout(level, optname, optval_ptr, optlen);
@@ -1395,13 +1395,13 @@ bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port,
 }
 
 X_STATUS XSocket::QueryName(bool peer, N_XSOCKADDR_IN* name) {
-  if (system_link()) {
+  if (on_system_link_) {
     const auto connected =
         system_link_stream_ ? system_link_stream_->peer() : system_link_peer_;
     const uint16_t port =
         system_link_stream_ ? system_link_stream_->port() : bound_port_;
     if (peer ? !connected : !port) {
-      // WSAENOTCONN without a connection, WSAEINVAL before a stream binds.
+      // WSAENOTCONN without a connection, WSAEINVAL before the socket binds.
       last_error_ = peer ? 10057 : 10022;
       return X_STATUS_UNSUCCESSFUL;
     }
@@ -1634,6 +1634,13 @@ object_ref<XSocket> XSocket::StreamAccept(N_XSOCKADDR* name, int* name_len) {
 
 int XSocket::SystemLinkSend(const uint8_t* buf, uint32_t buf_len,
                             const N_XSOCKADDR_IN* to) {
+  if (to) {
+    if (const uint32_t error = net::DatagramDestinationError(
+            {to->sin_addr, to->sin_port}, broadcast_socket_)) {
+      last_error_ = error;
+      return -1;
+    }
+  }
   // Sending binds an unbound socket.
   if (!system_link_port_ && BindSystemLink(0, 0) != X_STATUS_SUCCESS) {
     return -1;

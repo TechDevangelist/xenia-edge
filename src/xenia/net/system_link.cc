@@ -243,6 +243,18 @@ uint32_t Level(const Readiness& readiness) {
 
 }  // namespace
 
+uint32_t DatagramDestinationError(Endpoint destination, bool broadcast) {
+  const uint32_t address = destination.address;
+  if (!address || !destination.port ||
+      ((address >> 24) == 0x7F && address != kLoopback)) {
+    return kWsaAddressNotAvailable;
+  }
+  if (address == kBroadcast && !broadcast) {
+    return kWsaAccessDenied;
+  }
+  return 0;
+}
+
 struct SystemLink::State {
   struct QosListen {
     bool enabled = false;

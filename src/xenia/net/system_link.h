@@ -24,6 +24,7 @@ namespace xe::net {
 
 // Winsock error codes, as the guest sees them.
 inline constexpr uint32_t kWsaInterrupted = 10004;
+inline constexpr uint32_t kWsaAccessDenied = 10013;
 inline constexpr uint32_t kWsaInvalid = 10022;
 inline constexpr uint32_t kWsaWouldBlock = 10035;
 inline constexpr uint32_t kWsaAlready = 10037;
@@ -57,6 +58,10 @@ struct Endpoint {
   uint16_t port = 0;
   bool operator==(const Endpoint&) const = default;
 };
+
+// The error sendto fails a datagram to |destination| with before it binds or
+// sends anything, 0 if the send goes on. |broadcast| is SO_BROADCAST.
+uint32_t DatagramDestinationError(Endpoint destination, bool broadcast);
 
 // XNetQosListen flags.
 inline constexpr uint32_t kQosListenEnable = 0x01;
