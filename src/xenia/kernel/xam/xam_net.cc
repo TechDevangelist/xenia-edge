@@ -672,12 +672,20 @@ dword_result_t XNetLogonGetTitleID_entry(dword_t caller, lpvoid_t params) {
 }
 DECLARE_XAM_EXPORT1(XNetLogonGetTitleID, kNetworking, kImplemented);
 
-void NetDll_XNetInAddrToString_entry(dword_t caller, dword_t in_addr,
-                                     lpstring_t string_out,
-                                     dword_t string_size) {
-  strncpy(string_out, "666.666.666.666", string_size);
+dword_result_t NetDll_XNetInAddrToString_entry(dword_t caller, dword_t in_addr,
+                                               lpstring_t string_out,
+                                               dword_t string_size) {
+  const std::string text =
+      fmt::format("{}.{}.{}.{}", in_addr >> 24, (in_addr >> 16) & 0xFF,
+                  (in_addr >> 8) & 0xFF, in_addr & 0xFF);
+  if (string_out && string_size) {
+    const size_t count = std::min<size_t>(text.size(), string_size - 1);
+    std::memcpy(string_out, text.data(), count);
+    string_out[count] = '\0';
+  }
+  return 0;
 }
-DECLARE_XAM_EXPORT1(NetDll_XNetInAddrToString, kNetworking, kStub);
+DECLARE_XAM_EXPORT1(NetDll_XNetInAddrToString, kNetworking, kImplemented);
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
 // subsequent socket calls (like a handle to a XNet address)
