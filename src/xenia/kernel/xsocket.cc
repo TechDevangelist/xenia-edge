@@ -324,8 +324,7 @@ XSocket::XSocket(KernelState* kernel_state, asio::ip::tcp::socket socket)
 }
 
 XSocket::XSocket(KernelState* kernel_state,
-                 std::unique_ptr<net::SystemLinkStream> stream,
-                 uint32_t system_link_address)
+                 std::unique_ptr<net::SystemLinkStream> stream)
     : XObject(kernel_state, kObjectType),
       af_(AddressFamily::X_AF_INET),
       type_(Type::X_SOCK_STREAM),
@@ -333,8 +332,7 @@ XSocket::XSocket(KernelState* kernel_state,
       bound_(true),
       bound_port_(stream->port()),
       on_system_link_(true),
-      system_link_stream_(std::move(stream)),
-      system_link_address_(system_link_address) {}
+      system_link_stream_(std::move(stream)) {}
 
 XSocket::~XSocket() {
   // Guest memory may be going away with a socket the title never closed.
@@ -378,7 +376,6 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
       return X_STATUS_UNSUCCESSFUL;
     }
     on_system_link_ = true;
-    system_link_address_ = xe::load_and_swap<uint32_t>(link->identity().data());
     return X_STATUS_SUCCESS;
   }
 
@@ -1408,8 +1405,8 @@ X_STATUS XSocket::QueryName(bool peer, N_XSOCKADDR_IN* name) {
       last_error_ = peer ? 10057 : 10022;
       return X_STATUS_UNSUCCESSFUL;
     }
-    const net::Endpoint endpoint =
-        peer ? *connected : net::Endpoint{system_link_address_, port};
+    // getsockname reports 0.0.0.0 with the bound port.
+    const net::Endpoint endpoint = peer ? *connected : net::Endpoint{0, port};
     name->sin_family = AF_INET;
     name->sin_addr = endpoint.address;
     name->sin_port = endpoint.port;
@@ -1483,7 +1480,6 @@ X_STATUS XSocket::BindSystemLink(uint32_t address, uint16_t port) {
   system_link_port_ = std::move(bound);
   overlapped_receives_ =
       std::make_shared<OverlappedReceives>(system_link_port_.get());
-  system_link_address_ = own;
   bound_port_ = system_link_port_->port();
   bound_ = true;
   std::lock_guard<std::mutex> lock(select_mutex_);
@@ -1617,8 +1613,8 @@ object_ref<XSocket> XSocket::StreamAccept(N_XSOCKADDR* name, int* name_len) {
     return nullptr;
   }
   AcceptedName(name, name_len, peer);
-  auto socket = object_ref<XSocket>(
-      new XSocket(kernel_state_, std::move(accepted), system_link_address_));
+  auto socket =
+      object_ref<XSocket>(new XSocket(kernel_state_, std::move(accepted)));
   socket->recv_timeout_ms_ = recv_timeout_ms_;
   socket->send_timeout_ms_ = send_timeout_ms_;
   socket->linger_abort_ = linger_abort_;

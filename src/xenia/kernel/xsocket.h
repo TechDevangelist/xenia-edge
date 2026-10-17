@@ -202,8 +202,7 @@ class XSocket : public XObject {
   // Private constructor for accepted sockets
   XSocket(KernelState* kernel_state, asio::ip::tcp::socket socket);
   XSocket(KernelState* kernel_state,
-          std::unique_ptr<net::SystemLinkStream> stream,
-          uint32_t system_link_address);
+          std::unique_ptr<net::SystemLinkStream> stream);
 
   // Retry shape for RunCooperatively. A connect reports progress through error
   // codes a transfer never sees. Receive and send each pick a guest timeout
@@ -294,8 +293,6 @@ class XSocket : public XObject {
   // them on the I/O thread.
   struct OverlappedReceives;
   std::shared_ptr<OverlappedReceives> overlapped_receives_;
-  // This console's XNADDR ina, what getsockname reports.
-  uint32_t system_link_address_ = 0;
   // Set by connect(), where send() goes.
   std::optional<net::Endpoint> system_link_peer_;
 };
