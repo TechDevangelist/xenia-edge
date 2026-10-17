@@ -3309,10 +3309,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes,
           !route_to_host);
     }
-    if (route_to_host) {
-      // Output landed in host_buffer_ (guest RAM), already CPU coherent, so no
-      // readback. Record the written pages so geometry consumers route to the
-      // host buffer and texture loads copy their range into the device buffer.
+    if (route_to_host || shared_memory_->is_zero_copy()) {
+      // Output lands in guest RAM (host_buffer_, or buffer_ under zero-copy)
+      // with no readback needed. Record the written pages for fences and
+      // coherency requests to await. With the host buffer, geometry consumers
+      // also route to it and texture loads copy their range into the device
+      // buffer.
       for (const draw_util::MemExportRange& memexport_range :
            memexport_ranges_) {
         MarkMemexportPagesWritten(
@@ -3320,10 +3322,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
             memexport_range.size_bytes,
             IsMemexportAwaited(memexport_used_vertex, memexport_used_pixel));
       }
-    } else if (cvars::memexport_enable && !shared_memory_->is_zero_copy()) {
-      // No host buffer to route to, and buffer_ is device-local, so the CPU
-      // only sees the output if it is read back. Under zero-copy buffer_ is
-      // guest RAM already, and a readback there would clobber it.
+    } else if (cvars::memexport_enable) {
+      // There is no host buffer to route to and buffer_ is device-local. The
+      // CPU only sees the output if it is read back.
       StageMemexportReadback();
     }
   }

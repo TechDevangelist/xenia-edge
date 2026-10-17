@@ -4265,10 +4265,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   }
 
   if (!memexport_ranges_.empty()) {
-    if (route_to_host) {
-      // Producer draw: output landed in host_buffer_ (guest RAM), already CPU
-      // coherent, so no readback. Just record the written pages. Consumers then
-      // route to host_buffer_ (geometry) or copy their own range into the
+    if (route_to_host || shared_memory_->is_zero_copy()) {
+      // Producer draw: output lands in guest RAM (host_buffer_, or buffer_
+      // under zero-copy) with no readback needed. Just record the written pages
+      // for fences and coherency requests to await. With the host buffer,
+      // consumers then route to it (geometry) or copy their own range into the
       // device buffer on demand (texture loads).
       for (const draw_util::MemExportRange& memexport_range :
            memexport_ranges_) {
@@ -4277,10 +4278,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             memexport_range.size_bytes,
             IsMemexportAwaited(memexport_used_vertex, memexport_used_pixel));
       }
-    } else if (cvars::memexport_enable && !shared_memory_->is_zero_copy()) {
-      // No host buffer to route to, and buffer_ is device-local, so the CPU
-      // only sees the output if it is read back. Under zero-copy buffer_ is
-      // guest RAM already, and a readback there would clobber it.
+    } else if (cvars::memexport_enable) {
+      // There is no host buffer to route to and buffer_ is device-local. The
+      // CPU only sees the output if it is read back.
       StageMemexportReadback();
     }
   }
