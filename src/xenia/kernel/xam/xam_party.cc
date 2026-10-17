@@ -19,10 +19,18 @@ namespace xam {
 // XamPartyPartyCreate, XamPartyLeave, XamPartySendInvite, XamPartyJoinEx, &
 // XamPartyRemoveLocalUsers share one function
 
+// XPARTY_USER_LIST: a count padded to 8 bytes and 32 XPARTY_USER_INFO of
+// 0x78 bytes.
+constexpr size_t kPartyUserListSize = 0xF08;
+
 dword_result_t XamPartyGetUserList_entry(dword_t caller,
                                          lpvoid_t party_list_ptr) {
   if (caller != 1) {
     return X_E_NOT_IMPLEMENTED;
+  }
+  // Titles read the count without checking the result.
+  if (party_list_ptr) {
+    party_list_ptr.Zero(kPartyUserListSize);
   }
   // 5345085D, 45410923
   return 0x807D0003;  // X_PARTY_E_NOT_IN_PARTY
