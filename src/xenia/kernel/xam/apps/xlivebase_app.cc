@@ -10,6 +10,7 @@
 #include "xenia/kernel/xam/apps/xlivebase_app.h"
 
 #include "xenia/base/logging.h"
+#include "xenia/kernel/xenumerator.h"
 
 #include <asio.hpp>
 
@@ -20,10 +21,27 @@ struct XONLINE_SERVICE_INFO {
   xe::be<uint16_t> reserved;
 };
 
+struct X_ARGUMENT_ENTRY {
+  xe::be<uint32_t> native_size;
+  xe::be<uint64_t> argument_value_ptr;
+};
+static_assert_size(X_ARGUMENT_ENTRY, 0x10);
+
+struct X_CREATE_FRIENDS_ENUMERATOR {
+  X_ARGUMENT_ENTRY user_index;
+  X_ARGUMENT_ENTRY friends_starting_index;
+  X_ARGUMENT_ENTRY friends_amount;
+  X_ARGUMENT_ENTRY buffer_size_ptr;
+  X_ARGUMENT_ENTRY handle_ptr;
+};
+
 namespace xe {
 namespace kernel {
 namespace xam {
 namespace apps {
+
+constexpr uint32_t kOnlineMaxFriends = 100;
+constexpr uint32_t kOnlineFriendSize = 0xC4;  // X_ONLINE_FRIEND
 
 XLiveBaseApp::XLiveBaseApp(KernelState* kernel_state)
     : App(kernel_state, 0xFC) {}
@@ -94,13 +112,9 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
       return X_E_SUCCESS;
     }
     case 0x00058020: {
-      // 0x00058004 is called right before this.
-      // We should create a XamEnumerate-able empty list here, but I'm not
-      // sure of the format.
-      // buffer_length seems to be the same ptr sent to 0x00058004.
-      XELOGD("CXLiveFriends::Enumerate({:08X}, {:08X}) unimplemented",
-             buffer_ptr, buffer_length);
-      return X_E_FAIL;
+      XELOGD("XFriendsCreateEnumerator({:08X}, {:08X})", buffer_ptr,
+             buffer_length);
+      return XFriendsCreateEnumerator(buffer_length);
     }
     case 0x00058023: {
       XELOGD(
@@ -151,6 +165,56 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message,
       "arg2={:08X}",
       app_id(), message, buffer_ptr, buffer_length);
   return X_E_FAIL;
+}
+
+X_HRESULT XLiveBaseApp::XFriendsCreateEnumerator(uint32_t args_ptr) {
+  if (!args_ptr) {
+    return X_E_INVALIDARG;
+  }
+  const auto args =
+      memory_->TranslateVirtual<X_CREATE_FRIENDS_ENUMERATOR*>(args_ptr);
+  const uint32_t user_index_ptr =
+      static_cast<uint32_t>(args->user_index.argument_value_ptr);
+  const uint32_t starting_index_ptr =
+      static_cast<uint32_t>(args->friends_starting_index.argument_value_ptr);
+  const uint32_t amount_ptr =
+      static_cast<uint32_t>(args->friends_amount.argument_value_ptr);
+  const uint32_t buffer_size_ptr =
+      static_cast<uint32_t>(args->buffer_size_ptr.argument_value_ptr);
+  const uint32_t handle_ptr =
+      static_cast<uint32_t>(args->handle_ptr.argument_value_ptr);
+  if (!user_index_ptr || !starting_index_ptr || !amount_ptr ||
+      !buffer_size_ptr || !handle_ptr) {
+    return X_E_INVALIDARG;
+  }
+
+  const uint32_t user_index =
+      xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(user_index_ptr));
+  const uint32_t starting_index = xe::load_and_swap<uint32_t>(
+      memory_->TranslateVirtual(starting_index_ptr));
+  const uint32_t amount =
+      xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(amount_ptr));
+  if (user_index >= XUserMaxUserCount || starting_index >= kOnlineMaxFriends ||
+      amount > kOnlineMaxFriends) {
+    return X_E_INVALIDARG;
+  }
+  if (!kernel_state_->xam_state()->IsUserSignedIn(user_index)) {
+    return X_E_NO_SUCH_USER;
+  }
+
+  // No friends list is kept so the enumerator is always empty.
+  auto e = make_object<XStaticUntypedEnumerator>(kernel_state_, amount,
+                                                 kOnlineFriendSize);
+  auto result = e->Initialize(user_index, app_id(), 0x58021, 0x58022, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  xe::store_and_swap<uint32_t>(memory_->TranslateVirtual(buffer_size_ptr),
+                               amount * kOnlineFriendSize);
+  xe::store_and_swap<uint32_t>(memory_->TranslateVirtual(handle_ptr),
+                               e->handle());
+  return X_E_SUCCESS;
 }
 
 }  // namespace apps
