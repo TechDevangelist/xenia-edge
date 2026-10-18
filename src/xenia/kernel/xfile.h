@@ -170,7 +170,8 @@ class XFile : public XObject {
   // Clears the handle's wait state and runs |fn| on an I/O worker without
   // waiting.
   void PostIo(std::function<void()> fn);
-  // Signals the completion ports and this file's wait handle.
+  // Signals this file's wait handle. Posts to its completion port only for a
+  // request with an APC context.
   void NotifyCompletion(X_STATUS status, uint32_t num_bytes,
                         uint32_t apc_context);
 
@@ -183,7 +184,9 @@ class XFile : public XObject {
   X_STATUS SetLength(size_t length);
   X_STATUS Rename(const std::filesystem::path file_path);
 
-  void RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);
+  // False when the handle already has a port.
+  bool RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);
+  bool HasCompletionPort();
   void RemoveIOCompletionPort(uint32_t key);
 
   bool Save(ByteStream* stream) override;

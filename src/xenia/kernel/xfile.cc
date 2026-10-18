@@ -452,11 +452,19 @@ X_STATUS XFile::Rename(const std::filesystem::path file_path) {
   return X_STATUS_SUCCESS;
 }
 
-void XFile::RegisterIOCompletionPort(uint32_t key,
+bool XFile::RegisterIOCompletionPort(uint32_t key,
                                      object_ref<XIOCompletion> port) {
   std::lock_guard<std::mutex> lock(completion_port_lock_);
-
+  if (!completion_ports_.empty()) {
+    return false;
+  }
   completion_ports_.push_back({key, port});
+  return true;
+}
+
+bool XFile::HasCompletionPort() {
+  std::lock_guard<std::mutex> lock(completion_port_lock_);
+  return !completion_ports_.empty();
 }
 
 void XFile::RemoveIOCompletionPort(uint32_t key) {
@@ -525,11 +533,14 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state,
 
 void XFile::NotifyCompletion(X_STATUS status, uint32_t num_bytes,
                              uint32_t apc_context) {
-  XIOCompletion::IONotification notify;
-  notify.apc_context = apc_context;
-  notify.num_bytes = num_bytes;
-  notify.status = status;
-  NotifyIOCompletionPorts(notify);
+  // A request without an APC context posts no packet.
+  if (apc_context) {
+    XIOCompletion::IONotification notify;
+    notify.apc_context = apc_context;
+    notify.num_bytes = num_bytes;
+    notify.status = status;
+    NotifyIOCompletionPorts(notify);
+  }
   async_event_->Set();
 }
 

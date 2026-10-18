@@ -56,13 +56,18 @@ static void WriteIoStatus(X_IO_STATUS_BLOCK* status_block, X_STATUS status,
   status_block->status = status;
 }
 
-// A synchronous handle uses its file position, marked -1, without an offset or
-// with FILE_USE_FILE_POINTER_POSITION (-2). An async handle needs an offset. A
-// write given FILE_WRITE_TO_END_OF_FILE (-1) appends at XFile::kEndOfFile. Any
-// other negative offset is invalid.
-static X_STATUS ResolveByteOffset(XFile* file, lpqword_t byte_offset_ptr,
-                                  bool is_write, uint64_t* out_byte_offset) {
+// A handle bound to a completion port takes no APC routine. A synchronous
+// handle uses its file position, marked -1, without an offset or with
+// FILE_USE_FILE_POINTER_POSITION (-2). An async handle needs an offset. A write
+// given FILE_WRITE_TO_END_OF_FILE (-1) appends at XFile::kEndOfFile. Any other
+// negative offset is invalid.
+static X_STATUS ValidateRequest(XFile* file, uint32_t apc_routine,
+                                lpqword_t byte_offset_ptr, bool is_write,
+                                uint64_t* out_byte_offset) {
   *out_byte_offset = uint64_t(-1);
+  if (apc_routine && file->HasCompletionPort()) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   if (!byte_offset_ptr) {
     return file->is_synchronous() ? X_STATUS_SUCCESS
                                   : X_STATUS_INVALID_PARAMETER;
@@ -308,8 +313,8 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
   } else if (XSUCCEEDED(result)) {
-    result =
-        ResolveByteOffset(file.get(), byte_offset_ptr, false, &byte_offset);
+    result = ValidateRequest(file.get(), static_cast<uint32_t>(apc_routine_ptr),
+                             byte_offset_ptr, false, &byte_offset);
   }
 
   if (XSUCCEEDED(result)) {
@@ -392,8 +397,8 @@ dword_result_t NtReadFileScatter_entry(
     // Scatter reads need an unbuffered handle. STFS takes none.
     result = X_STATUS_INVALID_PARAMETER;
   } else if (XSUCCEEDED(result)) {
-    result =
-        ResolveByteOffset(file.get(), byte_offset_ptr, false, &byte_offset);
+    result = ValidateRequest(file.get(), static_cast<uint32_t>(apc_routine_ptr),
+                             byte_offset_ptr, false, &byte_offset);
   }
 
   if (XSUCCEEDED(result)) {
@@ -471,7 +476,8 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
   } else if (XSUCCEEDED(result)) {
-    result = ResolveByteOffset(file.get(), byte_offset_ptr, true, &byte_offset);
+    result = ValidateRequest(file.get(), apc_routine, byte_offset_ptr, true,
+                             &byte_offset);
   }
 
   // Execute write.

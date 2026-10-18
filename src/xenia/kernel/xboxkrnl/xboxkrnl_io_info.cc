@@ -323,10 +323,13 @@ dword_result_t NtSetInformationFile_entry(
       out_length = sizeof(*info);
       auto port =
           kernel_state()->object_table()->LookupObject<XIOCompletion>(handle);
-      if (!port) {
+      // Only an async handle binds to a port. It binds once.
+      if (file->is_synchronous() || file->HasCompletionPort()) {
+        result = X_STATUS_INVALID_PARAMETER;
+      } else if (!port) {
         result = X_STATUS_INVALID_HANDLE;
-      } else {
-        file->RegisterIOCompletionPort(key, port);
+      } else if (!file->RegisterIOCompletionPort(key, port)) {
+        result = X_STATUS_INVALID_PARAMETER;
       }
       break;
     }
