@@ -228,6 +228,116 @@ TEST_CASE("Host path entry found by its new name after a rename",
   std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("Host path entry moves into the directory it is renamed into",
+          "[vfs_rename]") {
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() /
+      ("xenia-vfs-rename-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(dir / "pack");
+  std::ofstream(dir / "temp.bin") << "data";
+
+  {
+    HostPathDevice device("\\Device\\Test", dir, false);
+    REQUIRE(device.Initialize());
+    Entry* entry = device.ResolvePath("temp.bin");
+    REQUIRE(entry != nullptr);
+
+    SECTION("into an existing directory") {
+      entry->Rename("cache:\\pack\\item.arc");
+
+      REQUIRE(device.ResolvePath("pack\\item.arc") == entry);
+      REQUIRE(entry->parent() == device.ResolvePath("pack"));
+      REQUIRE(entry->path() == "pack\\item.arc");
+      REQUIRE(device.ResolvePath("item.arc") == nullptr);
+      REQUIRE(device.ResolvePath("temp.bin") == nullptr);
+      REQUIRE(std::filesystem::exists(dir / "pack" / "item.arc"));
+    }
+
+    SECTION("into a missing directory") {
+      entry->Rename("cache:\\missing\\item.arc");
+
+      REQUIRE(device.ResolvePath("temp.bin") == entry);
+      REQUIRE(entry->name() == "temp.bin");
+      REQUIRE(std::filesystem::exists(dir / "temp.bin"));
+    }
+  }
+
+  std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("Host path rename checks the target name", "[vfs_rename]") {
+  struct TemporaryDirectory {
+    std::filesystem::path path =
+        std::filesystem::temp_directory_path() /
+        ("xenia-vfs-rename-" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    ~TemporaryDirectory() {
+      std::error_code error;
+      std::filesystem::remove_all(path, error);
+    }
+  } temporary;
+  REQUIRE(std::filesystem::create_directories(temporary.path / "dir"));
+  std::ofstream(temporary.path / "new.bin") << "new";
+  std::ofstream(temporary.path / "old.bin") << "old";
+
+  HostPathDevice device("test:", temporary.path, false);
+  REQUIRE(device.Initialize());
+  Entry* entry = device.ResolvePath("new.bin");
+  Entry* old_entry = device.ResolvePath("old.bin");
+  REQUIRE(entry);
+  REQUIRE(old_entry);
+  auto read = [&](const char* name) {
+    std::string text;
+    std::ifstream(temporary.path / name) >> text;
+    return text;
+  };
+
+  SECTION("A missing directory is reported") {
+    REQUIRE(entry->Rename("cache:\\missing\\item.bin") ==
+            X_STATUS_OBJECT_PATH_NOT_FOUND);
+  }
+
+  SECTION("An existing file is kept without replace") {
+    REQUIRE(entry->Rename("cache:\\OLD.BIN") == X_STATUS_OBJECT_NAME_COLLISION);
+    REQUIRE(device.ResolvePath("old.bin") == old_entry);
+    REQUIRE(device.ResolvePath("new.bin") == entry);
+    REQUIRE(read("old.bin") == "old");
+  }
+
+  SECTION("An existing file is replaced with replace") {
+    REQUIRE(entry->Rename("cache:\\old.bin", true) == X_STATUS_SUCCESS);
+    REQUIRE(device.ResolvePath("old.bin") == entry);
+    REQUIRE(device.ResolvePath("new.bin") == nullptr);
+    REQUIRE(device.ResolvePath("")->child_count() == 2);
+    REQUIRE(read("old.bin") == "new");
+  }
+
+  SECTION("An open file is not replaced") {
+    File* file = nullptr;
+    REQUIRE(old_entry->Open(FileAccess::kGenericRead, &file) ==
+            X_STATUS_SUCCESS);
+    REQUIRE(entry->Rename("cache:\\old.bin", true) == X_STATUS_ACCESS_DENIED);
+    file->Destroy();
+    REQUIRE(device.ResolvePath("old.bin") == old_entry);
+    REQUIRE(read("old.bin") == "old");
+  }
+
+  SECTION("A directory is not replaced") {
+    REQUIRE(entry->Rename("cache:\\dir", true) ==
+            X_STATUS_OBJECT_NAME_COLLISION);
+    REQUIRE(std::filesystem::is_directory(temporary.path / "dir"));
+  }
+
+  SECTION("Its own name is refused") {
+    REQUIRE(entry->Rename("cache:\\NEW.BIN") == X_STATUS_OBJECT_NAME_COLLISION);
+    REQUIRE(entry->Rename("cache:\\NEW.BIN", true) == X_STATUS_ACCESS_DENIED);
+    REQUIRE(entry->name() == "new.bin");
+  }
+}
+
 TEST_CASE("Host deletion waits for the last open handle", "[host_file]") {
   struct TemporaryDirectory {
     std::filesystem::path path =

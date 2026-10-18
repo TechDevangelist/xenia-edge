@@ -55,8 +55,8 @@ class HostPathEntry : public Entry {
   std::unique_ptr<Entry> CreateEntryInternal(const std::string_view name,
                                              uint32_t attributes) override;
   bool DeleteEntryInternal(Entry* entry) override;
-  void RenameEntryInternal(
-      const std::vector<std::string_view>& path_parts) override;
+  bool RenameEntryInternal(Entry* new_parent,
+                           const std::string_view name) override;
 
   std::filesystem::path host_path_;
   std::atomic<size_t> open_files_{0};

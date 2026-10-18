@@ -123,7 +123,8 @@ class Entry {
   bool Delete();
   void Touch();
 
-  void Rename(const std::filesystem::path file_path);
+  X_STATUS Rename(const std::filesystem::path file_path,
+                  bool replace_existing = false);
   // If successful, out_file points to a new file. When finished, call
   // file->Destroy()
   virtual X_STATUS Open(uint32_t desired_access, File** out_file) = 0;
@@ -144,8 +145,10 @@ class Entry {
     return nullptr;
   }
   virtual bool DeleteEntryInternal(Entry* entry) = 0;
-  virtual void RenameEntryInternal(
-      const std::vector<std::string_view>& path_parts) {}
+  virtual bool RenameEntryInternal(Entry* new_parent,
+                                   const std::string_view name) {
+    return true;
+  }
 
   xe::global_critical_region global_critical_region_;
   Device* device_;

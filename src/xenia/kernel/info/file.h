@@ -77,7 +77,8 @@ static_assert_size(X_FILE_INTERNAL_INFORMATION, 8);
 
 // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
 struct X_FILE_RENAME_INFORMATION {
-  be<uint32_t> replace_existing;
+  uint8_t replace_existing;
+  uint8_t pad[3];
   be<uint32_t> root_dir_handle;
   X_ANSI_STRING ansi_string;
 };
