@@ -56,6 +56,19 @@ static void WriteIoStatus(X_IO_STATUS_BLOCK* status_block, X_STATUS status,
   status_block->status = status;
 }
 
+// -1 reads from the file position, which a synchronous handle uses without an
+// offset or with FILE_USE_FILE_POINTER_POSITION (-2).
+static uint64_t ReadOffset(XFile* file, lpqword_t byte_offset_ptr) {
+  if (!byte_offset_ptr) {
+    return uint64_t(-1);
+  }
+  uint64_t byte_offset = *byte_offset_ptr;
+  if (byte_offset == uint64_t(-2) && file->is_synchronous()) {
+    return uint64_t(-1);
+  }
+  return byte_offset;
+}
+
 // Without a driver that queues every read, a zero-length read, a read at or
 // past EOF and a buffered read complete inline.
 static bool CompletesAsync(XFile* file, uint32_t length, uint64_t byte_offset) {
@@ -289,8 +302,7 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
   if (XSUCCEEDED(result)) {
     uint32_t buffer_address = buffer.guest_address();
     uint32_t length = buffer_length;
-    uint64_t byte_offset =
-        byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1;
+    uint64_t byte_offset = ReadOffset(file.get(), byte_offset_ptr);
     uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr);
     uint32_t apc_context_address = apc_context.guest_address();
     X_IO_STATUS_BLOCK* status_block = io_status_block;
@@ -371,8 +383,7 @@ dword_result_t NtReadFileScatter_entry(
   if (XSUCCEEDED(result)) {
     uint32_t segments_address = segment_array.guest_address();
     uint32_t read_length = length;
-    uint64_t byte_offset =
-        byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1;
+    uint64_t byte_offset = ReadOffset(file.get(), byte_offset_ptr);
     uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr);
     uint32_t apc_context_address = apc_context.guest_address();
     X_IO_STATUS_BLOCK* status_block = io_status_block;

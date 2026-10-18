@@ -231,10 +231,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
               }
             }
 
-            if (byte_offset) {
-              position_.store(byte_offset);
-            }
-            position_.fetch_add(bytes_read);
+            position_.store(byte_offset + bytes_read);
           }
         }
       }
@@ -357,13 +354,10 @@ X_STATUS XFile::ReadScatterInternal(uint32_t segments_guest_address,
     }
 
     uint32_t bytes_read = 0;
-    result =
-        ReadInternal(read_buffer, read_length,
-                     byte_offset ? ((byte_offset != -1 && byte_offset != -2)
-                                        ? byte_offset + read_total
-                                        : byte_offset)
-                                 : -1,
-                     &bytes_read, apc_context, false);
+    result = ReadInternal(
+        read_buffer, read_length,
+        byte_offset != uint64_t(-1) ? byte_offset + read_total : byte_offset,
+        &bytes_read, apc_context, false);
 
     if (result != X_STATUS_SUCCESS) {
       break;
