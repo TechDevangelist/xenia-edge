@@ -56,17 +56,30 @@ static void WriteIoStatus(X_IO_STATUS_BLOCK* status_block, X_STATUS status,
   status_block->status = status;
 }
 
-// -1 reads from the file position, which a synchronous handle uses without an
-// offset or with FILE_USE_FILE_POINTER_POSITION (-2).
-static uint64_t ReadOffset(XFile* file, lpqword_t byte_offset_ptr) {
+// A synchronous handle uses its file position, marked -1, without an offset or
+// with FILE_USE_FILE_POINTER_POSITION (-2). An async handle needs an offset. A
+// write given FILE_WRITE_TO_END_OF_FILE (-1) appends at XFile::kEndOfFile. Any
+// other negative offset is invalid.
+static X_STATUS ResolveByteOffset(XFile* file, lpqword_t byte_offset_ptr,
+                                  bool is_write, uint64_t* out_byte_offset) {
+  *out_byte_offset = uint64_t(-1);
   if (!byte_offset_ptr) {
-    return uint64_t(-1);
+    return file->is_synchronous() ? X_STATUS_SUCCESS
+                                  : X_STATUS_INVALID_PARAMETER;
   }
-  uint64_t byte_offset = *byte_offset_ptr;
-  if (byte_offset == uint64_t(-2) && file->is_synchronous()) {
-    return uint64_t(-1);
+  int64_t byte_offset = int64_t(uint64_t(*byte_offset_ptr));
+  if (byte_offset == -2 && file->is_synchronous()) {
+    return X_STATUS_SUCCESS;
   }
-  return byte_offset;
+  if (byte_offset == -1 && is_write) {
+    *out_byte_offset = XFile::kEndOfFile;
+    return X_STATUS_SUCCESS;
+  }
+  if (byte_offset < 0) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  *out_byte_offset = uint64_t(byte_offset);
+  return X_STATUS_SUCCESS;
 }
 
 // Without a driver that queues every read, a zero-length read, a read at or
@@ -291,18 +304,17 @@ dword_result_t NtReadFile_entry(dword_t file_handle, dword_t event_handle,
   }
 
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  uint64_t byte_offset = 0;
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
-  } else if (XSUCCEEDED(result) && !file->is_synchronous() &&
-             !byte_offset_ptr) {
-    // Without a byte offset, only a synchronous handle uses its file position.
-    result = X_STATUS_INVALID_PARAMETER;
+  } else if (XSUCCEEDED(result)) {
+    result =
+        ResolveByteOffset(file.get(), byte_offset_ptr, false, &byte_offset);
   }
 
   if (XSUCCEEDED(result)) {
     uint32_t buffer_address = buffer.guest_address();
     uint32_t length = buffer_length;
-    uint64_t byte_offset = ReadOffset(file.get(), byte_offset_ptr);
     uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr);
     uint32_t apc_context_address = apc_context.guest_address();
     X_IO_STATUS_BLOCK* status_block = io_status_block;
@@ -372,18 +384,21 @@ dword_result_t NtReadFileScatter_entry(
   }
 
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  uint64_t byte_offset = 0;
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
-  } else if (XSUCCEEDED(result) && !file->is_synchronous() &&
-             !byte_offset_ptr) {
-    // Without a byte offset, only a synchronous handle uses its file position.
+  } else if (XSUCCEEDED(result) &&
+             (file->is_buffered() || file->device()->name() == "STFS")) {
+    // Scatter reads need an unbuffered handle. STFS takes none.
     result = X_STATUS_INVALID_PARAMETER;
+  } else if (XSUCCEEDED(result)) {
+    result =
+        ResolveByteOffset(file.get(), byte_offset_ptr, false, &byte_offset);
   }
 
   if (XSUCCEEDED(result)) {
     uint32_t segments_address = segment_array.guest_address();
     uint32_t read_length = length;
-    uint64_t byte_offset = ReadOffset(file.get(), byte_offset_ptr);
     uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr);
     uint32_t apc_context_address = apc_context.guest_address();
     X_IO_STATUS_BLOCK* status_block = io_status_block;
@@ -452,12 +467,11 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
 
   // Grab file.
   auto file = kernel_state()->object_table()->LookupObject<XFile>(file_handle);
+  uint64_t byte_offset = 0;
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
-  } else if (XSUCCEEDED(result) && !file->is_synchronous() &&
-             !byte_offset_ptr) {
-    // Without a byte offset, only a synchronous handle uses its file position.
-    result = X_STATUS_INVALID_PARAMETER;
+  } else if (XSUCCEEDED(result)) {
+    result = ResolveByteOffset(file.get(), byte_offset_ptr, true, &byte_offset);
   }
 
   // Execute write.
@@ -466,10 +480,8 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
     if (true || file->is_synchronous()) {
       // Synchronous request.
       uint32_t bytes_written = 0;
-      result = file->Write(
-          buffer.guest_address(), buffer_length,
-          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-          &bytes_written, apc_context);
+      result = file->Write(buffer.guest_address(), buffer_length, byte_offset,
+                           &bytes_written, apc_context);
 
       if (io_status_block) {
         io_status_block->status = result;
@@ -508,11 +520,6 @@ dword_result_t NtWriteFile_entry(dword_t file_handle, dword_t event_handle,
         io_status_block->information = 0;
       }
     }
-  }
-
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
   }
 
   if (ev && signal_event) {

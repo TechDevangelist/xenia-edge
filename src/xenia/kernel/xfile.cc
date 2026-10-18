@@ -417,13 +417,18 @@ X_STATUS XFile::WriteInternal(uint32_t buffer_guest_address,
   if (byte_offset == uint64_t(-1)) {
     // Write from current position.
     byte_offset = position_.load();
+  } else if (byte_offset == kEndOfFile) {
+    // The entry's size is only refreshed on request.
+    entry()->update();
+    byte_offset = entry()->size();
   }
 
   size_t bytes_written = 0;
   X_STATUS result = file_->WriteSync(std::span<uint8_t>(buffer, buffer_length),
                                      size_t(byte_offset), &bytes_written);
-  if (XSUCCEEDED(result)) {
-    position_.fetch_add(bytes_written);
+  // A zero-length write leaves the position alone.
+  if (XSUCCEEDED(result) && buffer_length) {
+    position_.store(byte_offset + bytes_written);
   }
 
   if (out_bytes_written) {
