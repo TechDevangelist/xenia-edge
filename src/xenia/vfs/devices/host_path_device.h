@@ -42,7 +42,7 @@ class HostPathDevice : public Device {
 
   bool supports_concurrent_io() const override { return true; }
 
-  bool queues_all_reads() const override { return name_ == "STFS"; }
+  bool queues_all_requests() const override { return name_ == "STFS"; }
 
   const std::string& name() const override { return name_; }
   uint32_t attributes() const override { return 0; }

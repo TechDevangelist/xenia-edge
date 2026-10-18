@@ -250,11 +250,29 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
 }
 
 void XFile::PostIo(std::function<void()> fn) {
-  // Cleared at issue, as NT clears the file object event, so a wait on the
-  // handle cannot return on an earlier request's completion.
-  async_event_->Reset();
-  kernel_state()->guest_scheduler()->PostHostCall(std::move(fn),
-                                                  io_call_class());
+  {
+    std::lock_guard<std::mutex> lock(posted_lock_);
+    posted_.push_back(std::move(fn));
+    if (posted_running_) {
+      return;
+    }
+    posted_running_ = true;
+  }
+  // Outside the lock, as a post after shutdown began runs inline.
+  kernel_state()->guest_scheduler()->PostHostCall(
+      [file = retain_object(this)]() { file->RunPostedIo(); }, io_call_class());
+}
+
+void XFile::RunPostedIo() {
+  std::unique_lock<std::mutex> lock(posted_lock_);
+  while (!posted_.empty()) {
+    std::function<void()> fn = std::move(posted_.front());
+    posted_.pop_front();
+    lock.unlock();
+    fn();
+    lock.lock();
+  }
+  posted_running_ = false;
 }
 
 uint64_t XFile::ReserveDriveTime(uint64_t byte_offset, uint32_t length) {
@@ -380,19 +398,19 @@ X_STATUS XFile::ReadScatterInternal(uint32_t segments_guest_address,
 
 X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length,
                       uint64_t byte_offset, uint32_t* out_bytes_written,
-                      uint32_t apc_context) {
+                      uint32_t apc_context, bool notify_completion) {
   X_STATUS result = X_STATUS_SUCCESS;
   RunSynchronousIo([&]() {
     result = WriteInternal(buffer_guest_address, buffer_length, byte_offset,
-                           out_bytes_written, apc_context);
+                           out_bytes_written, apc_context, notify_completion);
   });
   return result;
 }
 
 X_STATUS XFile::WriteInternal(uint32_t buffer_guest_address,
                               uint32_t buffer_length, uint64_t byte_offset,
-                              uint32_t* out_bytes_written,
-                              uint32_t apc_context) {
+                              uint32_t* out_bytes_written, uint32_t apc_context,
+                              bool notify_completion) {
   // Physical memory is read through the unprotected physical view, as a host
   // write from a watched page would fail rather than fault into its callbacks.
   // Those are triggered first as for a guest read, which brings in resolve
@@ -435,7 +453,9 @@ X_STATUS XFile::WriteInternal(uint32_t buffer_guest_address,
     *out_bytes_written = uint32_t(bytes_written);
   }
 
-  NotifyCompletion(result, uint32_t(bytes_written), apc_context);
+  if (notify_completion) {
+    NotifyCompletion(result, uint32_t(bytes_written), apc_context);
+  }
   return result;
 }
 

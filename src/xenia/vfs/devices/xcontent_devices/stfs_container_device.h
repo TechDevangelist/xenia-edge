@@ -35,7 +35,7 @@ class StfsContainerDevice : public XContentContainerDevice {
 
   bool supports_concurrent_io() const override { return true; }
 
-  bool queues_all_reads() const override { return true; }
+  bool queues_all_requests() const override { return true; }
 
   uint32_t component_name_max_length() const override { return 40; }
 

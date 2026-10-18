@@ -11,6 +11,7 @@
 #define XENIA_KERNEL_XFILE_H_
 
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -167,8 +168,10 @@ class XFile : public XObject {
                        uint64_t byte_offset, uint32_t* out_bytes_read,
                        uint32_t apc_context, bool notify_completion = true);
 
-  // Clears the handle's wait state and runs |fn| on an I/O worker without
-  // waiting.
+  // Clears the handle's wait state, as every new request does.
+  void ResetWaitState() { async_event_->Reset(); }
+  // Runs |fn| on an I/O worker without waiting, after every request posted
+  // before it.
   void PostIo(std::function<void()> fn);
   // Signals this file's wait handle. Posts to its completion port only for a
   // request with an APC context.
@@ -179,7 +182,7 @@ class XFile : public XObject {
   static constexpr uint64_t kEndOfFile = uint64_t(1) << 63;
   X_STATUS Write(uint32_t buffer_guess_address, uint32_t buffer_length,
                  uint64_t byte_offset, uint32_t* out_bytes_written,
-                 uint32_t apc_context);
+                 uint32_t apc_context, bool notify_completion = true);
 
   X_STATUS SetLength(size_t length);
   X_STATUS Rename(const std::filesystem::path file_path);
@@ -213,6 +216,9 @@ class XFile : public XObject {
   // KernelState::RunBlockingIo.
   void RunSynchronousIo(const std::function<void()>& fn);
 
+  // Runs the requests PostIo queued until none are left.
+  void RunPostedIo();
+
   // Books this read on the medium and returns when it would be delivered, or
   // 0 for a read this does not model.
   uint64_t ReserveDriveTime(uint64_t byte_offset, uint32_t length);
@@ -234,7 +240,7 @@ class XFile : public XObject {
                                uint32_t apc_context, bool notify_completion);
   X_STATUS WriteInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
                          uint64_t byte_offset, uint32_t* out_bytes_written,
-                         uint32_t apc_context);
+                         uint32_t apc_context, bool notify_completion);
 
   vfs::File* file_ = nullptr;
   // The handle's wait state. Manual reset like NT's file object event, so every
@@ -242,6 +248,10 @@ class XFile : public XObject {
   std::unique_ptr<threading::Event> async_event_ = nullptr;
 
   mutable std::mutex file_lock_;
+  // Requests PostIo queued. One worker at a time runs them in order.
+  std::mutex posted_lock_;
+  std::deque<std::function<void()>> posted_;
+  bool posted_running_ = false;
   std::mutex completion_port_lock_;
   std::vector<std::pair<uint32_t, object_ref<XIOCompletion>>> completion_ports_;
 
