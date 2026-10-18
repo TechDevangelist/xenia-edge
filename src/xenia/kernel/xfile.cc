@@ -24,11 +24,12 @@ namespace xe {
 namespace kernel {
 
 XFile::XFile(KernelState* kernel_state, vfs::File* file, bool synchronous,
-             bool alertable)
+             bool alertable, bool buffered)
     : XObject(kernel_state, kObjectType),
       file_(file),
       is_synchronous_(synchronous),
-      is_alertable_(alertable) {
+      is_alertable_(alertable),
+      is_buffered_(buffered) {
   async_event_ = threading::Event::CreateManualResetEvent(false);
   assert_not_null(async_event_);
 }

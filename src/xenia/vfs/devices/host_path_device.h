@@ -27,9 +27,11 @@ class HostPathEntry;
 
 class HostPathDevice : public Device {
  public:
+  // |name| is the file system the directory stands in for.
   HostPathDevice(const std::string_view mount_path,
                  const std::filesystem::path& host_path, bool read_only,
-                 bool collapse_content_packages = false);
+                 bool collapse_content_packages = false,
+                 const std::string_view name = "FATX");
   ~HostPathDevice() override;
 
   bool Initialize() override;
@@ -39,6 +41,8 @@ class HostPathDevice : public Device {
   bool is_read_only() const override { return read_only_; }
 
   bool supports_concurrent_io() const override { return true; }
+
+  bool queues_all_reads() const override { return name_ == "STFS"; }
 
   const std::string& name() const override { return name_; }
   uint32_t attributes() const override { return 0; }

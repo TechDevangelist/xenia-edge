@@ -16,12 +16,14 @@
 #include <string>
 #include <vector>
 
+#include "xenia/base/byte_order.h"
 #include "xenia/vfs/devices/host_path_device.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
 #include "xenia/vfs/entry.h"
 #include "xenia/vfs/file.h"
 #include "xenia/vfs/gdfx_util.h"
 #include "xenia/vfs/xbe_metadata.h"
+#include "xenia/vfs/xex_metadata.h"
 
 #include "third_party/catch/include/catch.hpp"
 
@@ -158,6 +160,44 @@ TEST_CASE("XBE metadata", "[xbe]") {
     auto xbe = MakeXbe(0x12);
     xbe[0] = 0;
     REQUIRE(!ExtractXbeMetadata(xbe.data(), xbe.size()));
+  }
+}
+
+// A XEX2 header holding just the security info, which allows |media|.
+static std::vector<uint8_t> MakeXex(uint32_t media,
+                                    uint32_t header_size = 0x200) {
+  std::vector<uint8_t> xex(0x200);
+  Put<uint32_t>(xex, 0x0, xe::byte_swap(0x58455832u));
+  Put<uint32_t>(xex, 0x8, xe::byte_swap(header_size));
+  Put<uint32_t>(xex, 0x10, xe::byte_swap(0x20u));
+  Put<uint32_t>(xex, 0x20 + 0x17C, xe::byte_swap(media));
+  return xex;
+}
+
+TEST_CASE("XEX allowed media", "[xex]") {
+  SECTION("An arcade title runs only from a package") {
+    const auto xex = MakeXex(0x18000000);
+    auto m = ExtractXexMetadata(xex.data(), xex.size());
+    REQUIRE(m);
+    REQUIRE(m->allowed_media_types == 0x18000000);
+    REQUIRE(m->RunsFromPackageOnly());
+  }
+
+  SECTION("A disc title, or one converted to Games on Demand, does not") {
+    for (uint32_t media : {0x00000004u, 0x00001000u}) {
+      const auto xex = MakeXex(media);
+      auto m = ExtractXexMetadata(xex.data(), xex.size());
+      REQUIRE(m);
+      REQUIRE(!m->RunsFromPackageOnly());
+    }
+  }
+
+  SECTION("Security info past the header allows nothing") {
+    const auto xex = MakeXex(0x18000000, 0x100);
+    auto m = ExtractXexMetadata(xex.data(), xex.size());
+    REQUIRE(m);
+    REQUIRE(m->allowed_media_types == 0);
+    REQUIRE(!m->RunsFromPackageOnly());
   }
 }
 

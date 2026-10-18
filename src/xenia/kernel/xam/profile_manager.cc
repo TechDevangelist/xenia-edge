@@ -321,8 +321,8 @@ bool ProfileManager::MountProfile(const uint64_t xuid, std::string mount_path) {
   }
   mount_path += ':';
 
-  auto device =
-      std::make_unique<vfs::HostPathDevice>(mount_path, profile_path, false);
+  auto device = std::make_unique<vfs::HostPathDevice>(mount_path, profile_path,
+                                                      false, false, "STFS");
   if (!device->Initialize()) {
     XELOGE(
         "MountProfile: Unable to mount {} profile; file not found or "

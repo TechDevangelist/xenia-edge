@@ -825,8 +825,6 @@ void XThread::Reenter(uint32_t address) {
   // Called when the game switches fiber stacks (e.g., via
   // KeSetCurrentStackPointers in games like Forza Horizon 2).
   // Must unwind through all frames between here and Execute().
-  // No user APC routine frame survives the unwind.
-  user_apc_depth_ = 0;
 #if !XE_PLATFORM_WIN32
   // Throw a C++ exception that unwinds through JIT frames (using DWARF
   // .eh_frame info) and host frames (using compiler-generated DWARF),

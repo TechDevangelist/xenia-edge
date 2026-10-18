@@ -137,9 +137,9 @@ class XFile : public XObject {
   static const XObject::Type kObjectType = XObject::Type::File;
 
   // |alertable| is FILE_SYNCHRONOUS_IO_ALERT: a user APC can interrupt the
-  // wait.
+  // wait. |buffered| is the absence of FILE_NO_INTERMEDIATE_BUFFERING.
   XFile(KernelState* kernel_state, vfs::File* file, bool synchronous,
-        bool alertable);
+        bool alertable, bool buffered);
   ~XFile() override;
 
   vfs::Device* device() const { return file_->entry()->device(); }
@@ -189,6 +189,7 @@ class XFile : public XObject {
                                    ByteStream* stream);
 
   bool is_synchronous() const { return is_synchronous_; }
+  bool is_buffered() const { return is_buffered_; }
 
  protected:
   void NotifyIOCompletionPorts(XIOCompletion::IONotification& notification);
@@ -250,6 +251,7 @@ class XFile : public XObject {
 
   bool is_synchronous_ = false;
   bool is_alertable_ = false;
+  bool is_buffered_ = false;
 };
 
 }  // namespace kernel

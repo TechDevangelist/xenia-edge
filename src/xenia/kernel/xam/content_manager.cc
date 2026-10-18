@@ -45,8 +45,8 @@ ContentPackage::ContentPackage(KernelState* kernel_state,
 
   auto fs = kernel_state_->file_system();
   if (std::filesystem::is_directory(package_path)) {
-    auto device = std::make_unique<vfs::HostPathDevice>(device_path_,
-                                                        package_path, false);
+    auto device = std::make_unique<vfs::HostPathDevice>(
+        device_path_, package_path, false, false, "STFS");
     mounted_ = device->Initialize();
     fs->RegisterDevice(std::move(device));
   } else {

@@ -1532,16 +1532,9 @@ static bool ProcessApcList(PPCContext* ctx, X_KTHREAD* current_thread,
     uint32_t arg2 = xe::load_and_swap<uint32_t>(scratch_ptr + 12);
 
     if (normal_routine) {
-      XThread* thread = list_index == 1 ? XThread::GetCurrentThread() : nullptr;
-      if (thread) {
-        thread->EnterUserApc();
-      }
       uint64_t normal_args[] = {normal_context, arg1, arg2};
       ctx->processor->Execute(ctx->thread_state, normal_routine, normal_args,
                               xe::countof(normal_args));
-      if (thread) {
-        thread->LeaveUserApc();
-      }
     }
 
     unlocked_irql = xeKeKfAcquireSpinLock(ctx, &current_thread->apc_lock);

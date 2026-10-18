@@ -58,6 +58,9 @@ struct XexMetadata {
   uint8_t disc_number = 0;
   uint8_t disc_count = 0;
 
+  // From the security info
+  uint32_t allowed_media_types = 0;
+
   // From XEX_HEADER_GAME_RATINGS
   struct {
     bool present = false;
@@ -68,6 +71,9 @@ struct XexMetadata {
     uint8_t oflc_au = 0xFF;
     uint8_t oflc_nz = 0xFF;
   } ratings;
+
+  // True for an executable no disc can hold, so one an STFS package held.
+  bool RunsFromPackageOnly() const;
 
   toml::table ToToml() const;
 };
