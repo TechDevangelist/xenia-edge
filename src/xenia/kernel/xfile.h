@@ -171,8 +171,13 @@ class XFile : public XObject {
   // Clears the handle's wait state, as every new request does.
   void ResetWaitState() { async_event_->Reset(); }
   // Runs |fn| on an I/O worker without waiting, after every request posted
-  // before it.
-  void PostIo(std::function<void()> fn);
+  // before it. |thread| issued the request. |fn| is told whether it was
+  // cancelled instead.
+  void PostIo(XThread* thread, std::function<void(bool cancelled)> fn);
+  // Cancels the requests |thread| posted that have yet to start.
+  void CancelPostedIo(XThread* thread);
+  // True while a request |thread| posted has yet to complete.
+  bool HasPostedIo(XThread* thread);
   // Signals this file's wait handle. Posts to its completion port only for a
   // request with an APC context.
   void NotifyCompletion(X_STATUS status, uint32_t num_bytes,
@@ -248,10 +253,13 @@ class XFile : public XObject {
   std::unique_ptr<threading::Event> async_event_ = nullptr;
 
   mutable std::mutex file_lock_;
-  // Requests PostIo queued. One worker at a time runs them in order.
+  // Requests PostIo queued, with the thread that issued each. One worker at a
+  // time runs them in order.
   std::mutex posted_lock_;
-  std::deque<std::function<void()>> posted_;
+  std::deque<std::pair<XThread*, std::function<void(bool)>>> posted_;
   bool posted_running_ = false;
+  // The thread that issued the request running now.
+  XThread* posted_running_thread_ = nullptr;
   std::mutex completion_port_lock_;
   std::vector<std::pair<uint32_t, object_ref<XIOCompletion>>> completion_ports_;
 

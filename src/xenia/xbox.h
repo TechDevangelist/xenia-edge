@@ -79,6 +79,7 @@ typedef uint32_t X_STATUS;
 #define X_STATUS_INVALID_PARAMETER_3                    ((X_STATUS)0xC00000F1L)
 #define X_STATUS_NOT_A_DIRECTORY                        ((X_STATUS)0xC0000103L)
 #define X_STATUS_PROCESS_IS_TERMINATING                 ((X_STATUS)0xC000010AL)
+#define X_STATUS_CANCELLED                              ((X_STATUS)0xC0000120L)
 #define X_STATUS_DLL_NOT_FOUND                          ((X_STATUS)0xC0000135L)
 #define X_STATUS_ENTRYPOINT_NOT_FOUND                   ((X_STATUS)0xC0000139L)
 #define X_STATUS_MAPPED_ALIGNMENT                       ((X_STATUS)0xC0000220L)

@@ -121,10 +121,10 @@ static X_STATUS SubmitRequest(const object_ref<XFile>& file,
   }
   file->ResetWaitState();
   auto complete = [file, ev, thread, apc_routine, apc_context, status_block,
-                   status_block_address,
-                   transfer = std::move(transfer)](bool posted) {
+                   status_block_address, transfer = std::move(transfer)](
+                      bool posted, bool cancelled) {
     uint32_t bytes = 0;
-    X_STATUS status = transfer(&bytes);
+    X_STATUS status = cancelled ? X_STATUS_CANCELLED : transfer(&bytes);
     // A failure the caller was not told PENDING for completes nothing.
     if (!posted && XFAILED(status)) {
       return status;
@@ -146,10 +146,13 @@ static X_STATUS SubmitRequest(const object_ref<XFile>& file,
       status_block->status = X_STATUS_PENDING;
       status_block->information = 0;
     }
-    file->PostIo([complete = std::move(complete)]() { complete(true); });
+    file->PostIo(thread.get(),
+                 [complete = std::move(complete)](bool cancelled) {
+                   complete(true, cancelled);
+                 });
     return X_STATUS_PENDING;
   }
-  X_STATUS status = complete(false);
+  X_STATUS status = complete(false, false);
   // A kernel APC the completion queued runs before the service returns.
   xeProcessKernelApcs(thread->thread_state()->context());
   return status;
@@ -565,15 +568,26 @@ dword_result_t NtRemoveIoCompletion_entry(
 DECLARE_XBOXKRNL_EXPORT2(NtRemoveIoCompletion, kFileSystem, kImplemented,
                          kHighFrequency);
 
-dword_result_t NtCancelIoFile_entry(dword_t handle) {
+dword_result_t NtCancelIoFile_entry(dword_t handle,
+                                    const ppc_context_t& context) {
   auto file = kernel_state()->object_table()->LookupObject<XFile>(handle);
   if (!file) {
     return X_STATUS_INVALID_HANDLE;
   }
-
+  // The calling thread's requests on the file that have yet to start complete
+  // as cancelled. The call returns once the one running has completed,
+  // polling every 10 ms.
+  XThread* thread = XThread::GetCurrentThread();
+  file->CancelPostedIo(thread);
+  while (file->HasPostedIo(thread)) {
+    uint64_t interval = uint64_t(-100000);
+    KeDelayExecutionThread(0, false, &interval, context);
+  }
+  // A kernel APC the completions queued runs before the service returns.
+  xeProcessKernelApcs(context);
   return X_STATUS_SUCCESS;
 }
-DECLARE_XBOXKRNL_EXPORT1(NtCancelIoFile, kFileSystem, kStub);
+DECLARE_XBOXKRNL_EXPORT1(NtCancelIoFile, kFileSystem, kImplemented);
 
 dword_result_t NtQueryFullAttributesFile_entry(
     pointer_t<X_OBJECT_ATTRIBUTES> obj_attribs,

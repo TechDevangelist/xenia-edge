@@ -249,10 +249,10 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address,
   return result;
 }
 
-void XFile::PostIo(std::function<void()> fn) {
+void XFile::PostIo(XThread* thread, std::function<void(bool cancelled)> fn) {
   {
     std::lock_guard<std::mutex> lock(posted_lock_);
-    posted_.push_back(std::move(fn));
+    posted_.emplace_back(thread, std::move(fn));
     if (posted_running_) {
       return;
     }
@@ -266,13 +266,46 @@ void XFile::PostIo(std::function<void()> fn) {
 void XFile::RunPostedIo() {
   std::unique_lock<std::mutex> lock(posted_lock_);
   while (!posted_.empty()) {
-    std::function<void()> fn = std::move(posted_.front());
+    auto [thread, fn] = std::move(posted_.front());
     posted_.pop_front();
+    posted_running_thread_ = thread;
     lock.unlock();
-    fn();
+    fn(false);
     lock.lock();
+    posted_running_thread_ = nullptr;
   }
   posted_running_ = false;
+}
+
+void XFile::CancelPostedIo(XThread* thread) {
+  std::vector<std::function<void(bool)>> cancelled;
+  {
+    std::lock_guard<std::mutex> lock(posted_lock_);
+    for (auto it = posted_.begin(); it != posted_.end();) {
+      if (it->first == thread) {
+        cancelled.push_back(std::move(it->second));
+        it = posted_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (auto& fn : cancelled) {
+    fn(true);
+  }
+}
+
+bool XFile::HasPostedIo(XThread* thread) {
+  std::lock_guard<std::mutex> lock(posted_lock_);
+  if (posted_running_thread_ == thread) {
+    return true;
+  }
+  for (const auto& posted : posted_) {
+    if (posted.first == thread) {
+      return true;
+    }
+  }
+  return false;
 }
 
 uint64_t XFile::ReserveDriveTime(uint64_t byte_offset, uint32_t length) {
